@@ -1,42 +1,36 @@
 import { Router } from "express";
 import { mapToCanonical } from "../mapping/map.js";
+import { chooseExtractor } from "../extractors/index.js";
 
 const router = Router();
 
-/**
- * POST /api/extract
- * body: { url: string, siteId?: "auto" | "macys" | "...", fields?: ["sku","price","color","size"] }
- * For now returns a MOCKED table so your extension/website can integrate immediately.
- */
 router.post("/extract", async (req, res) => {
   try {
     const { url, siteId = "auto", fields = ["sku","price","color","size"] } = req.body || {};
     if (!url) return res.status(400).json({ error: "Missing url" });
 
-    // TODO: later -> run Playwright and the correct extractor module
-    // MOCK raw table that looks like a typical site output:
-    const rawTable = {
-      headers: ["Color", "Size", "SKU", "Price"],
-      rows: [
-        ["Red", "M", "SKU123", "$19.99"],
-        ["Blue", "L", "SKU124", "$21.99"]
-      ]
-    };
+    const extractor = chooseExtractor(siteId, url);
+    if (!extractor) return res.status(400).json({ error: "No extractor for this site" });
 
-    const mapped = mapToCanonical(rawTable, fields);
+    // Run site extractor (HTML fetch + parse)
+    const raw = await extractor.extract({ url, fields });
+
+    // Map first raw table to canonical fields
+    const first = raw.rawTables?.[0] || { headers: [], rows: [] };
+    const mapped = mapToCanonical(first, fields);
 
     return res.json({
       status: "done",
-      siteId,
+      siteId: extractor.id,
       requestedFields: fields,
-      table: mapped.table,            // [[sku,price,color,size], ...] in requested order
-      headers: mapped.headers,        // headers in the same order as table columns
-      confidence: mapped.confidence,  // rough confidence score 0..1
-      debug: { inputHeaders: rawTable.headers }
+      headers: mapped.headers,
+      table: mapped.table,
+      confidence: mapped.confidence,
+      debug: { inputHeaders: first.headers, rowsIn: first.rows.length }
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Server error", detail: e.message });
   }
 });
 
