@@ -4,7 +4,7 @@
   "version": "1.0",
   "description": "Extracts SKU, UPC, Color, Size, Price, and Availability from Macy's pages. Supports current page and multiple URLs.",
   "permissions": ["tabs", "scripting", "storage", "activeTab"],
-  "host_permissions": ["https://www.macys.com/*"],
+  "host_permissions": ["https://product-extractor-backend.onrender.com/*"],
   "web_accessible_resources": [
   {
     "resources": ["inject.js"],
@@ -22,4 +22,5 @@
       "128": "icon.png"
     }
   }
+
 }
