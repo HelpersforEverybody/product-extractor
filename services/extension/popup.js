@@ -9,7 +9,7 @@ function loadData(callback) {
     callback(result.lastExtractedData || []);
   });
 }
-
+const SERVER_URL = "https://product-extractor.onrender.com";
 document.addEventListener('DOMContentLoaded', () => {
   // Restore last data when popup opens
   const tbody = document.querySelector('#dataTable tbody');
@@ -143,4 +143,5 @@ document.getElementById('download').addEventListener('click', () => {
   } else {
     alert('No data to download.');
   }
+
 });
