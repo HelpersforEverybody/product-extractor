@@ -10,6 +10,62 @@ function loadData(callback) {
   });
 }
 const SERVER_URL = "https://product-extractor.onrender.com";
+document.getElementById('currentServer').addEventListener('click', () => {
+  chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+    const tab = tabs[0];
+    const body = {
+      url: tab.url,
+      siteId: "auto", // or "macys"
+      fields: ["sku","price","color","size"]
+    };
+    try {
+      const resp = await fetch(`${SERVER_URL}/api/extract`, {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json' },
+        body: JSON.stringify(body)
+      });
+      const json = await resp.json();
+      const table = json.table || [];
+      const headers = json.headers || ['sku','price','color','size'];
+
+      // Render into your existing table
+      const thead = document.querySelector('#dataTable thead tr');
+      const tbody = document.querySelector('#dataTable tbody');
+      thead.innerHTML = '';
+      headers.forEach(h => {
+        const th = document.createElement('th');
+        th.textContent = h.toUpperCase();
+        thead.appendChild(th);
+      });
+      tbody.innerHTML = '';
+      table.forEach(row => {
+        const tr = document.createElement('tr');
+        row.forEach(val => {
+          const td = document.createElement('td');
+          td.textContent = val ?? 'N/A';
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+
+      // Save so your existing restore logic works
+      const mapped = table.map(r => ({
+        sku: r[headers.indexOf('sku')] || 'N/A',
+        upc: '', url: tab.url,
+        color: r[headers.indexOf('color')] || 'N/A',
+        size: r[headers.indexOf('size')] || 'N/A',
+        currentPrice: r[headers.indexOf('price')] || 'N/A',
+        regularPrice: '', availability: ''
+      }));
+      chrome.storage.local.set({ lastExtractedData: mapped });
+
+    } catch (e) {
+      alert('Server extraction failed');
+      console.error(e);
+    }
+  });
+});
+
 document.addEventListener('DOMContentLoaded', () => {
   // Restore last data when popup opens
   const tbody = document.querySelector('#dataTable tbody');
@@ -145,3 +201,4 @@ document.getElementById('download').addEventListener('click', () => {
   }
 
 });
+
