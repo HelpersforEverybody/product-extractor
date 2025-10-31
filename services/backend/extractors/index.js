@@ -9,5 +9,7 @@ export function chooseExtractor(siteId, url) {
   try {
     const host = new URL(url).hostname;
     return REGISTRY.find(x => x.match.hostRegex.test(host)) || null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
