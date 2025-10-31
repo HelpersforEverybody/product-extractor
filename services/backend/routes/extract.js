@@ -1,44 +1,41 @@
 import { Router } from "express";
-import { mapToCanonical } from "../mapping/map.js";
 import { chooseExtractor } from "../extractors/index.js";
 
 const router = Router();
 
+/**
+ * POST /api/extract
+ * { url: string, siteId?: "auto" | "macys" }
+ * Returns: { headers, table } with 8 columns your popup expects.
+ */
 router.post("/extract", async (req, res) => {
   const startedAt = Date.now();
   try {
-    const { url, siteId = "auto", fields = ["sku","price","color","size"] } = req.body || {};
+    const { url, siteId = "auto" } = req.body || {};
     if (!url) return res.status(400).json({ error: "Missing url" });
 
     const extractor = chooseExtractor(siteId, url);
-    if (!extractor) {
-      return res.status(400).json({ error: "No extractor for this site", detail: { siteId, url } });
-    }
+    if (!extractor) return res.status(400).json({ error: "No extractor for this site" });
 
-    const raw = await extractor.extract({ url, fields });
-    const first = raw?.rawTables?.[0] || { headers: [], rows: [] };
-    const mapped = mapToCanonical(first, fields);
+    const raw = await extractor.extract({ url });
+    const tableObj = raw?.rawTables?.[0] || { headers: [], rows: [] };
+
+    // enforce header order to match your popup (safety)
+    const HEADERS = ["sku","upc","url","color","size","currentPrice","regularPrice","availability"];
+    const rows = tableObj.rows || [];
 
     return res.json({
       status: "done",
-      durationMs: Date.now() - startedAt,
       siteId: extractor.id,
-      requestedFields: fields,
-      headers: mapped.headers,
-      table: mapped.table,
-      confidence: mapped.confidence,
-      debug: { inputHeaders: first.headers, rowsIn: first.rows.length }
+      headers: HEADERS,
+      table: rows,
+      durationMs: Date.now() - startedAt
     });
   } catch (e) {
-    console.error("EXTRACT ERROR:", e?.message || e, e?.stack || "");
-    const status = e?.statusCode || e?.status || 500;
-    return res.status(status).json({
+    console.error("EXTRACT ERROR:", e?.message || e);
+    res.status(e?.statusCode || 500).json({
       error: "Server error",
-      detail: {
-        message: e?.message || "unknown",
-        code: e?.code || null,
-        name: e?.name || null
-      }
+      detail: { message: e?.message || "unknown" }
     });
   }
 });
