@@ -7,7 +7,7 @@ import extractRouter from "./routes/extract.js";
 dotenv.config();
 const app = express();
 
-// CORS (reflect origin) + preflight
+// --- CORS (reflect origin) + preflight ---
 app.use((req, res, next) => {
   const origin = req.headers.origin || "*";
   res.setHeader("Access-Control-Allow-Origin", origin);
@@ -19,7 +19,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// tiny request log
+// --- tiny request log ---
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   next();
@@ -29,12 +29,18 @@ app.use(express.json({ limit: "2mb" }));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Optional static landing page if you have /public
 app.use(express.static(path.join(__dirname, "public")));
 
+// --- EXPOSE /tmp for debug artifacts (screenshots, traces) ---
+app.use("/debug", express.static("/tmp"));
+
 app.get("/api/health", (_req, res) => {
-  res.status(200).type("application/json").send(JSON.stringify({
-    ok: true, uptime: process.uptime(), time: new Date().toISOString()
-  }));
+  res
+    .status(200)
+    .type("application/json")
+    .send(JSON.stringify({ ok: true, uptime: process.uptime(), time: new Date().toISOString() }));
 });
 
 app.use("/api", extractRouter);
