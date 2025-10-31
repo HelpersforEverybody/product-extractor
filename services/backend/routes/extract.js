@@ -1,13 +1,15 @@
 import { Router } from "express";
-import { chooseExtractor } from "../extractors/index.js";
-import fs from "fs";
+import { chooseExtractor } from "../extractor/index.js"; // NOTE: your folder is 'extractor'
 import { chromium } from "playwright";
 
 const router = Router();
 
 /**
  * POST /api/extract
- * body: { url, siteId, debug }
+ * body: { url: string, siteId?: "auto"|"macys", debug?: 0|1 }
+ * - Uses your registered extractor (Macy's, etc.)
+ * - If debug=1, runs a Playwright session to capture trace/screenshot and passes the page to the extractor.
+ * - Returns your 8 headers in the exact popup order.
  */
 router.post("/extract", async (req, res) => {
   const startedAt = Date.now();
@@ -15,61 +17,63 @@ router.post("/extract", async (req, res) => {
 
   if (!url) return res.status(400).json({ error: "Missing url" });
 
-  let browser, context, page, traceUrl = null;
+  let browser = null;
+  let context = null;
+  let page = null;
+  let traceUrl = null;
+  let screenshotUrl = null;
 
   try {
-    // ✅ Browser & debug mode only if debug=1
+    const extractor = chooseExtractor(siteId, url);
+    if (!extractor) {
+      return res.status(400).json({ error: "No extractor for this site" });
+    }
+
+    // --- Optional debug Playwright session ---
     if (debug) {
-      console.log("⚠️ DEBUG MODE ENABLED FOR:", url);
+      console.log("⚠️ DEBUG MODE ENABLED:", url);
 
       browser = await chromium.launch({
-        headless: process.env.PLAYWRIGHT_HEADLESS !== "false"
+        headless: process.env.PLAYWRIGHT_HEADLESS !== "false",
+        args: ["--no-sandbox", "--disable-setuid-sandbox"]
       });
-
       context = await browser.newContext();
       page = await context.newPage();
 
-      // Log console messages from target site
-      page.on("console", msg => console.log("🟡 PAGE LOG:", msg.text()));
-      page.on("requestfailed", req => console.log("❌ Failed request:", req.url()));
+      // Log site console + failing requests
+      page.on("console", (msg) => console.log("🟡 PAGE:", msg.text()));
+      page.on("requestfailed", (req) => console.log("❌ REQ FAILED:", req.url()));
 
-      await context.tracing.start({
-        screenshots: true,
-        snapshots: true,
-        sources: true,
-      });
+      await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
 
       await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
 
-      // Screenshot before extraction
+      // First screenshot (page loaded)
       await page.screenshot({ path: "/tmp/debug_page.png", fullPage: true });
-
-      console.log("✅ Page loaded for debug");
+      screenshotUrl = `${process.env.RENDER_EXTERNAL_URL || ""}/debug/debug_page.png`;
     }
 
-    // ✅ Real extractor call (your architecture — DO NOT TOUCH)
-    const extractor = chooseExtractor(siteId, url);
-    if (!extractor) throw new Error("No extractor for this site");
-
-    const raw = await extractor.extract({ url, page }); 
-    // we pass page so extractor CAN use it if coded to do so
+    // --- Call your site extractor (page is optional; extractor can ignore if it does its own fetch) ---
+    const raw = await extractor.extract({ url, page, debug });
 
     const tableObj = raw?.rawTables?.[0] || { headers: [], rows: [] };
     const HEADERS = [
-      "sku","upc","url","color","size",
-      "currentPrice","regularPrice","availability"
+      "sku",
+      "upc",
+      "url",
+      "color",
+      "size",
+      "currentPrice",
+      "regularPrice",
+      "availability"
     ];
     const rows = tableObj.rows || [];
 
-    // ✅ Stop trace, save file if debug
+    // Finish trace if running
     if (debug && context) {
-      console.log("📦 Saving trace...");
       await context.tracing.stop({ path: "/tmp/trace.zip" });
-
-      traceUrl = `${process.env.RENDER_EXTERNAL_URL}/debug/trace.zip`;
-      console.log("📎 Trace ready at:", traceUrl);
+      traceUrl = `${process.env.RENDER_EXTERNAL_URL || ""}/debug/trace.zip`;
     }
-
     if (browser) await browser.close();
 
     return res.json({
@@ -78,21 +82,16 @@ router.post("/extract", async (req, res) => {
       headers: HEADERS,
       table: rows,
       durationMs: Date.now() - startedAt,
-      debugFiles: debug ? {
-        trace: traceUrl,
-        screenshot: `${process.env.RENDER_EXTERNAL_URL}/debug/debug_page.png`
-      } : null
+      debugFiles: debug ? { trace: traceUrl, screenshot: screenshotUrl } : null
     });
-
   } catch (e) {
-    console.error("❌ EXTRACT ERROR:", e?.message);
+    console.error("❌ EXTRACT ERROR:", e?.message || e);
+    if (browser) try { await browser.close(); } catch {}
 
-    if (browser) await browser.close();
-
-    return res.status(500).json({
+    return res.status(e?.statusCode || 500).json({
       error: "Server error",
-      detail: e?.message,
-      debug: traceUrl
+      detail: { message: e?.message || "unknown" },
+      debugFiles: debug ? { trace: traceUrl, screenshot: screenshotUrl } : null
     });
   }
 });
