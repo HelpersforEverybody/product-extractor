@@ -1,7 +1,6 @@
 import { Router } from "express";
-import { chooseExtractor } from "../extractor/index.js"; // NOTE: singular folder 'extractor'
+import { chooseExtractor } from "../extractors/index.js"; // NOTE: singular folder 'extractor'
 import { chromium } from "playwright";
-import { chooseExtractor } from "../extractors/index.js";
 
 
 const router = Router();
