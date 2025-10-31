@@ -1,48 +1,54 @@
 import express from "express";
-import cors from "cors";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import extractRouter from "./routes/extract.js";
 
 dotenv.config();
+
 const app = express();
 
 /**
- * --- VERY PERMISSIVE CORS (for debugging) ---
- * Once your flow works, we’ll restrict to your frontend/extension origins.
+ * --- UNIVERSAL CORS (debug-friendly) ---
+ * - Reflects the caller Origin (frontend, extension, local)
+ * - Handles OPTIONS preflight for every path
+ * - Sends proper headers even if route doesn't exist
  */
 app.use((req, res, next) => {
-  // Always set CORS headers
-  res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
-  res.header("Vary", "Origin");
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  // Short-circuit preflight
-  if (req.method === "OPTIONS") return res.sendStatus(204);
+  const origin = req.headers.origin || "*";
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin"); // so proxies don't cache CORS wrongly
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+  // Some browsers/devices:
+  res.setHeader("Access-Control-Allow-Credentials", "false");
+
+  if (req.method === "OPTIONS") {
+    // Important: end preflight here with success
+    return res.status(204).end();
+  }
   next();
 });
 
-// You can still keep cors() (it adds some sane defaults)
-app.use(cors());
-
+// JSON body
 app.use(express.json({ limit: "2mb" }));
 
-// (Optional) serve a static landing page if /public exists
+// Optional static landing (if /public exists)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, "public")));
 
-// Health check
+// Health
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
+  res.json({ ok: true, uptime: process.uptime(), time: new Date().toISOString() });
 });
 
-// API routes
+// API
 app.use("/api", extractRouter);
 
-// Start server
+// 404 (still with CORS headers because of the top middleware)
+app.use((req, res) => res.status(404).json({ error: "Not found" }));
+
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ API running on port ${PORT}`);
-});
+app.listen(PORT, "0.0.0.0", () => console.log(`✅ API running on port ${PORT}`));
