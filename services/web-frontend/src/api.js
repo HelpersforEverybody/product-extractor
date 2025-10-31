@@ -1,8 +1,7 @@
-// Put your Render API base here:
-export const API_BASE = "https://product-extractor.onrender.com";
-
+// Instead of the absolute backend URL, use a relative path
+export const API_BASE = ""; // same origin (frontend)
 export async function extractViaServer({ url, siteId = "auto", fields }) {
-  const resp = await fetch(`${API_BASE}/api/extract`, {
+  const resp = await fetch(`/api/extract`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url, siteId, fields })
