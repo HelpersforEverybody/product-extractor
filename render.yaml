@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: product-extractor
+    env: docker
+    rootDir: services/backend
+    plan: starter
+    dockerfilePath: services/backend/Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
