@@ -55,6 +55,7 @@ router.post("/extract", async (req, res) => {
         locale: "en-US",
         timezoneId: "America/New_York",
         viewport: { width: 1366, height: 768 },
+        ignoreHTTPSErrors: true,  
       });
       await context.setExtraHTTPHeaders({
         Accept:
@@ -71,7 +72,9 @@ router.post("/extract", async (req, res) => {
       );
 
       await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
-      await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+
       await page.screenshot({ path: "/tmp/debug_page.png", fullPage: true });
 
       screenshotUrl = `${process.env.RENDER_EXTERNAL_URL || ""}/debug/debug_page.png`;
@@ -95,6 +98,7 @@ router.post("/extract", async (req, res) => {
             locale: "en-US",
             timezoneId: "America/New_York",
             viewport: { width: 1366, height: 768 },
+            ignoreHTTPSErrors: true,  
           });
           await context.setExtraHTTPHeaders({
             Accept:
