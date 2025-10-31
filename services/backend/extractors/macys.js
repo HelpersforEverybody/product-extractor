@@ -203,7 +203,9 @@ export default {
 
     try {
       if (!injectedPage) {
-        await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+
       }
 
       // Wait for Macy's React state (upcs) to populate
