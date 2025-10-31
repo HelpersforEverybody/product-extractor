@@ -3,64 +3,51 @@ import * as cheerio from "cheerio";
 import { chromium } from "playwright";
 
 /**
- * Macy's extractor:
- * 1) Try static HTML (cheap).
- * 2) If no variants or 4xx/empty -> Playwright and read window.__INITIAL_STATE__.
- * 3) Fallback to JSON-LD if needed.
+ * Macy's extractor that mirrors your extension:
+ * - Primary: JSON-LD offers (id=productMktData / any ld+json)
+ * - SIZE mapping from window.__INITIAL_STATE__ (relationships.upcs[].attributes[name=SIZE])
+ * - UPC = offer.SKU with "USA" removed (same as your code)
+ * - availability = last segment of the URL ("InStock"/"OutOfStock")
+ * - regularPrice: try to read from JSON-LD, else blank (do NOT hardcode)
+ * - Returns 8 columns exactly like your popup expects
  */
 export default {
   id: "macys",
   match: { hostRegex: /(^|\.)macys\.com$/i },
 
-  async extract({ url, fields = ["sku","price","color","size"] }) {
-    // --- 1) Static HTML fetch ---
+  async extract({ url }) {
+    // 1) Try static HTML first (cheap)
     try {
       const html = await fetchHTML(url);
-      const staticData = preferRicher(parseInitialStateFromHTML(html), parseJsonLd(html));
-      const { headers, rows } = buildRows(staticData);
-      if (rows.length) {
-        return ok(staticData, headers, rows, url);
-      }
+      const rows = await buildRowsFromHtml(html, url);
+      if (rows.length) return rowsResponse(rows);
     } catch (_) {
-      // ignore and go to Playwright
+      // ignore and fall back to Playwright
     }
 
-    // --- 2) Playwright (browser render) ---
-    const rendered = await renderAndGrab(url);
-    const pwData = preferRicher(
-      parseInitialStateObject(rendered.initialState),
-      parseJsonLd(rendered.html)
-    );
-    const pwBuilt = buildRows(pwData);
-    if (pwBuilt.rows.length) {
-      return ok(pwData, pwBuilt.headers, pwBuilt.rows, url);
-    }
-
-    // --- 3) Last-ditch: try to read variant elements from DOM ---
-    const domGuessed = parseFromDOM(rendered.html);
-    const guessedBuilt = buildRows(domGuessed);
-    return ok(domGuessed, guessedBuilt.headers, guessedBuilt.rows, url);
+    // 2) Fallback: render with Playwright to access window.__INITIAL_STATE__ reliably
+    const { html, initialState } = await renderAndGrab(url);
+    const rows = await buildRowsFromHtml(html, url, initialState);
+    return rowsResponse(rows);
   }
 };
 
-// ---------- Helpers ----------
-function ok(data, headers, rows, url) {
+// ---------- helpers ----------
+function rowsResponse(rows) {
   return {
     siteId: "macys",
-    rawTables: [{ headers, rows }],
-    meta: {
-      title: data.title || "",
-      price: data.price || "",
-      currency: data.currency || "USD",
-      url
-    }
+    rawTables: [{
+      headers: ["sku","upc","url","color","size","currentPrice","regularPrice","availability"],
+      rows
+    }],
+    meta: { count: rows.length }
   };
 }
 
 async function fetchHTML(url) {
   const resp = await axios.get(url, {
     headers: {
-      "User-Agent": ua(),
+      "User-Agent": UA,
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.9",
       "Cache-Control": "no-cache"
@@ -76,161 +63,134 @@ async function fetchHTML(url) {
   return resp.data;
 }
 
-function ua() {
-  return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-}
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// ===== JSON-LD from HTML =====
-function parseJsonLd(html) {
-  const $ = cheerio.load(html || "");
-  const blocks = [];
-  $('script[type="application/ld+json"]').each((_, el) => {
-    const txt = $(el).html() || "";
-    try { blocks.push(JSON.parse(txt.trim())); } catch {}
-  });
-
-  let title = "", price = "", currency = "USD", variants = [];
-  const all = blocks.flatMap(x => Array.isArray(x) ? x : [x]);
-  for (const item of all) {
-    const type = String(item?.['@type'] || item?.type || "").toLowerCase();
-    if (!type.includes("product")) continue;
-    title = item.name || title;
-    const offers = Array.isArray(item.offers) ? item.offers[0] : item.offers;
-    if (offers) {
-      price = offers.price || price || offers?.priceSpecification?.price || "";
-      currency = offers.priceCurrency || offers.priceCurrencyCode || currency;
-    }
-    const sku = item.sku || item.mpn || "";
-    if (sku || item.color || item.size) {
-      variants.push({ sku, color: item.color || "", size: item.size || "", price: price || "" });
-    }
-  }
-  return { title, price, currency, variants };
-}
-
-// ===== __INITIAL_STATE__ from HTML (regex) =====
-function parseInitialStateFromHTML(html) {
-  let m = html?.match(/__INITIAL_STATE__\s*=\s*({[\s\S]*?})\s*;?\s*<\/script>/i);
-  if (!m) return {};
-  try {
-    const obj = JSON.parse(m[1]);
-    return parseInitialStateObject(obj);
-  } catch { return {}; }
-}
-
-// ===== Parse product object from initial state (object) =====
-function parseInitialStateObject(obj) {
-  if (!obj) return {};
-  let title = "", price = "", currency = "USD", variants = [];
-
-  try {
-    // try typical locations
-    const p =
-      obj?.product ||
-      obj?.pdp ||
-      obj?.entities?.product ||
-      obj?.entities?.products ||
-      obj?.page?.product ||
-      {};
-
-    title = p.name || p.title || obj?.page?.title || title;
-
-    price =
-      p.price?.sale ??
-      p.price?.min ??
-      p.offerPrice ??
-      p.price ??
-      price;
-
-    currency = p.currency || currency;
-
-    // try SKU/variants arrays in various shapes
-    const skus =
-      p.skus ||
-      p.variants ||
-      p.skuList ||
-      p.items ||
-      obj?.entities?.skus ||
-      [];
-
-    variants = (Array.isArray(skus) ? skus : Object.values(skus)).map(s => ({
-      sku: s.sku || s.id || s.upc || s.partNumber || "",
-      color: s.color || s.colorName || s.variantColor || s.attributeColor || "",
-      size: s.size || s.sizeName || s.variantSize || s.attributeSize || "",
-      price: s.price?.sale ?? s.price ?? price
-    }));
-  } catch {}
-
-  return { title, price, currency, variants };
-}
-
-// ===== Playwright: render + read window.__INITIAL_STATE__ directly =====
 async function renderAndGrab(url) {
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-setuid-sandbox"] });
-  const page = await browser.newPage({ userAgent: ua(), locale: "en-US" });
+  const page = await browser.newPage({ userAgent: UA, locale: "en-US" });
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    // give client scripts a moment to populate window state
     await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(800);
-
+    await page.waitForTimeout(600);
     const result = await page.evaluate(() => {
-      const state = (window).__INITIAL_STATE__ || (window).initialState || null;
-      // capture JSON-LD quickly too
-      const ld = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
-        .map(s => s.textContent)
-        .filter(Boolean);
-      return { state, ldCount: ld.length, html: document.documentElement.outerHTML };
+      const state = (window).__INITIAL_STATE__ || null;
+      const html = document.documentElement.outerHTML;
+      return { html, state };
     });
-
-    return { initialState: result.state, html: result.html };
+    return { html: result.html, initialState: result.state };
   } finally {
     await browser.close();
   }
 }
 
-// ===== very soft DOM guess (if everything else fails) =====
-function parseFromDOM(html) {
+function parseOffersFromJsonLd(html) {
   const $ = cheerio.load(html || "");
-  let title = $("h1, [data-el='product-title']").first().text().trim();
-  let price = $("[data-el='price'], .price, [itemprop='price']").first().text().trim();
-  const rows = [];
-  // try variant tables
-  $("[data-el='size'], [data-el='color']").each((_i, el) => {
-    const t = $(el).text().trim();
-    if (t) rows.push(["", "", "", t]);
-  });
-  return { title, price, currency: "USD", variants: rows.map(r => ({ color: r[0], size: r[1], sku: r[2], price: r[3] })) };
-}
-
-// ===== Build rows =====
-function buildRows(data) {
-  const headers = ["SKU", "PRICE", "COLOR", "SIZE"];
-  const rows = (data?.variants || []).map(v => ([
-    v.sku || "",
-    toPrice(v.price ?? data.price ?? ""),
-    v.color || "",
-    v.size || ""
-  ])).filter(r => r.some(x => String(x).trim() !== ""));
-
-  if (!rows.length) {
-    const one = toPrice(data?.price ?? "");
-    if (one) rows.push(["", one, "", ""]);
+  const blocks = [];
+  // Prefer specific id (your extension) if present
+  const special = $("#productMktData").html();
+  if (special) {
+    try { blocks.push(JSON.parse(special.trim())); } catch {}
   }
-  return { headers, rows };
+  // Also take all ld+json as fallback
+  $('script[type="application/ld+json"]').each((_, el) => {
+    const txt = $(el).html() || "";
+    try { blocks.push(JSON.parse(txt.trim())); } catch {}
+  });
+
+  // Flatten, pick Product with offers
+  const all = blocks.flatMap(x => Array.isArray(x) ? x : [x]).filter(Boolean);
+  const offers = [];
+  let regularPriceHint = ""; // if JSON-LD exposes a reference/regular price
+
+  for (const item of all) {
+    const type = String(item?.['@type'] || item?.type || "").toLowerCase();
+    if (!type.includes("product")) continue;
+
+    const rawOffers = Array.isArray(item.offers) ? item.offers : (item.offers ? [item.offers] : []);
+    for (const off of rawOffers) {
+      const sku = off?.sku || off?.skuId || off?.itemOffered?.sku || off?.mpn || "";
+      const color = off?.itemOffered?.color || "";
+      const price =
+        off?.price ??
+        off?.priceSpecification?.price ??
+        "";
+      // best-effort reference price
+      const rp =
+        off?.priceSpecification?.referencePrice ??
+        off?.priceSpecification?.priceCurrencyBeforeDiscount ??
+        off?.priceSpecification?.priceBeforeDiscount ??
+        "";
+      if (rp) regularPriceHint = rp;
+      const availability = String(off?.availability || "").split("/").pop() || "";
+
+      offers.push({ sku, color, price: toMoney(price), availability, regularPriceHint });
+    }
+  }
+  return offers;
 }
 
-function toPrice(x) {
+function getSizeMapFromInitialState(state) {
+  // You said your extension reads:
+  // initialState.pageData.product.product.relationships.upcs[].attributes (name === 'SIZE') → value, key by identifier.upcNumber
+  const map = {};
+  try {
+    const upcs =
+      state?.pageData?.product?.product?.relationships?.upcs ||
+      state?.product?.relationships?.upcs ||
+      [];
+    for (const u of upcs) {
+      const upc = u?.identifier?.upcNumber || u?.identifier?.upc || u?.upc || "";
+      const attrs = u?.attributes || [];
+      const sizeAttr = attrs.find(a => (a?.name || "").toUpperCase() === "SIZE");
+      const size = sizeAttr?.value || "";
+      if (upc) map[upc.replace(/\D+/g, "")] = size; // numeric string key
+    }
+  } catch {}
+  return map;
+}
+
+async function buildRowsFromHtml(html, url, initialState = null) {
+  const offers = parseOffersFromJsonLd(html);
+  let sizeMap = {};
+  if (!initialState) {
+    // try to extract __INITIAL_STATE__ via regex if not passed in
+    const m = html?.match(/__INITIAL_STATE__\s*=\s*({[\s\S]*?})\s*;?\s*<\/script>/i);
+    if (m) {
+      try { initialState = JSON.parse(m[1]); } catch {}
+    }
+  }
+  if (initialState) sizeMap = getSizeMapFromInitialState(initialState);
+
+  const rows = [];
+  for (const off of offers) {
+    const skuRaw = String(off.sku || "").trim();
+    const upc = skuRaw.replace(/USA/gi, "").replace(/\D+/g, ""); // your extension cleans UPC removing "USA"
+    const color = off.color || "";
+    // SIZE priority: offer.itemOffered.attributes[name=SIZE] first — JSON-LD rarely has it, so fallback to sizeMap
+    const size = sizeMap[upc] || ""; // same fallback as your code
+    const currentPrice = off.price || "";
+    const regularPrice = toMoney(off.regularPriceHint || ""); // leave blank if unknown
+    const availability = off.availability || ""; // already last segment in parse
+
+    rows.push([
+      skuRaw || "",         // sku
+      upc || "",            // upc (cleaned)
+      url,                  // url
+      color || "",          // color
+      size || "",           // size
+      currentPrice || "",   // currentPrice
+      regularPrice || "",   // regularPrice
+      availability || ""    // availability
+    ]);
+  }
+  return rows;
+}
+
+function toMoney(x) {
   if (x == null) return "";
   const s = String(x).trim();
   if (!s) return "";
+  // If it already looks like $12.34 keep it, else prefix $
   if (/^\$/.test(s)) return s;
-  return s ? `$${s}` : "";
-}
-
-function preferRicher(a, b) {
-  const ac = (a?.variants || []).length;
-  const bc = (b?.variants || []).length;
-  if (ac && bc) return ac >= bc ? a : b;
-  return ac ? a : (bc ? b : (a || b || {}));
+  return `$${s}`;
 }
