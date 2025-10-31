@@ -70,8 +70,21 @@ async function renderAndGrab(url) {
   const page = await browser.newPage({ userAgent: UA, locale: "en-US" });
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(600);
+   // wait for Macy's initial state to load
+await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
+
+// Macy's loads UPC/size in __INITIAL_STATE__ asynchronously
+try {
+  await page.waitForFunction(
+    () => window.__INITIAL_STATE__ &&
+          window.__INITIAL_STATE__.pageData?.product?.product?.relationships?.upcs?.length > 0,
+    { timeout: 6000 }
+  );
+} catch {}
+
+// small buffer delay like extension
+await page.waitForTimeout(800);
+
     const result = await page.evaluate(() => {
       const state = (window).__INITIAL_STATE__ || null;
       const html = document.documentElement.outerHTML;
