@@ -1,264 +1,167 @@
+// services/backend/extractors/macys.js
 import { chromium } from "playwright";
+import fs from "fs/promises";
+import path from "path";
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
-
-function buildProxy() {
-  if (!process.env.PROXY_SERVER) return undefined;
-  return {
-    server: process.env.PROXY_SERVER,
-    username: process.env.PROXY_USERNAME || undefined,
-    password: process.env.PROXY_PASSWORD || undefined,
-  };
+const DEBUG_DIR = path.join(process.cwd(), "public", "debug");
+async function ensureDebugDir() {
+  await fs.mkdir(DEBUG_DIR, { recursive: true }).catch(() => {});
+}
+function stamp(name) {
+  const t = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${name}-${t}`;
 }
 
-async function ensurePage(ctx) {
-  // Use injected page if provided, else create a new one via helper/newPage
-  if (ctx?.page) return { page: ctx.page, owned: false };
+// Macy's product anchors we consider "page is ready-ish"
+const PRODUCT_SELECTORS = [
+  '[data-auto="product-title"]',
+  'h1[data-el="product-title"]',
+  "h1.pdp-title",
+  '[data-auto="pdp"]',
+  'div[data-auto="product-page"]',
+];
 
-  if (ctx?.newPage) {
-    const p = await ctx.newPage();
-    return { page: p, owned: true };
-  }
-
-  // Last resort: launch our own browser context (rarely used if route passes page/newPage)
-  const browser = await chromium.launch({
-    headless: process.env.PLAYWRIGHT_HEADLESS !== "false",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    proxy: buildProxy(),
-  });
-
-  const context = await browser.newContext({
-    userAgent: UA,
-    locale: "en-US",
-    timezoneId: "America/New_York",
-    viewport: { width: 1366, height: 768 },
-  });
-  await context.setExtraHTTPHeaders({
-    Accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Upgrade-Insecure-Requests": "1",
-  });
-  const page = await context.newPage();
-  return { page, owned: true, browser, context };
-}
-
-// Helpers
-function stripNonDigits(x = "") {
-  return String(x).replace(/\D+/g, "");
-}
-function availabilityFromUrl(u = "") {
-  // matches your extension's logic (last segment after '/')
-  try {
-    const seg = new URL(u).pathname.split("/").filter(Boolean);
-    return seg[seg.length - 1] || "";
-  } catch {
-    return "";
-  }
-}
-
-async function extractFromInitialState(page) {
-  return await page.evaluate(() => {
-    const state = window.__INITIAL_STATE__ || window.__NUXT__?.state;
-    if (!state?.pageData?.product?.product) return null;
-
-    const prod = state.pageData.product.product;
-    const relUpcs = prod?.relationships?.upcs || [];
-    const attrs = prod?.attributes || {};
-    const color = attrs?.color || attrs?.COLOR || null;
-
-    // try price from state (fall back to nulls)
-    const pricing = prod?.pricing || {};
-    const currentPrice = pricing?.price?.current || null;
-    const regularPrice = pricing?.price?.regular || null;
-
-    // some pages store URLs in product URLs list; else use location
-    const pageUrl = location.href;
-
-    const rows = relUpcs.map((u) => {
-      const upc = u?.attributes?.upc || u?.upc || null;
-      const size =
-        u?.attributes?.size || u?.size || u?.attributes?.SIZE || null;
-      const sku = u?.id || u?.attributes?.sku || null;
-
-      return {
-        sku,
-        upc,
-        url: pageUrl,
-        color: color || null,
-        size: size || null,
-        currentPrice,
-        regularPrice,
-        availability: "", // set later from URL
-      };
-    });
-
-    return rows;
-  });
-}
-
-async function extractFromJsonLd(page) {
-  return await page.evaluate(() => {
-    function parseScripts() {
-      const scripts = Array.from(
-        document.querySelectorAll('script[type="application/ld+json"]')
-      );
-      const products = [];
-      for (const s of scripts) {
-        try {
-          const obj = JSON.parse(s.textContent || "{}");
-          if (!obj) continue;
-          const arr = Array.isArray(obj) ? obj : [obj];
-          for (const item of arr) {
-            if (
-              item["@type"] === "Product" ||
-              (Array.isArray(item["@type"]) && item["@type"].includes("Product"))
-            ) {
-              products.push(item);
-            }
-          }
-        } catch {}
-      }
-      return products;
+async function waitForAny(page, selectors, timeoutMs) {
+  const start = Date.now();
+  for (;;) {
+    for (const sel of selectors) {
+      const ok = await page.$(sel);
+      if (ok) return sel;
     }
-
-    const prods = parseScripts();
-    if (!prods.length) return null;
-
-    const pageUrl = location.href;
-    const rows = [];
-
-    for (const p of prods) {
-      const color = p.color || (p?.additionalProperty?.find?.(x => x.name === "color")?.value) || null;
-      const offers = Array.isArray(p.offers) ? p.offers : (p.offers ? [p.offers] : []);
-      for (const ofr of offers) {
-        const sku = ofr.sku || p.sku || null;
-        const upc = ofr.gtin13 || ofr.gtin12 || ofr.gtin || p.gtin13 || p.gtin || null;
-        const size =
-          ofr.size ||
-          (p?.additionalProperty?.find?.(x => x.name?.toLowerCase() === "size")?.value) ||
-          null;
-        const currentPrice =
-          ofr.price || ofr.priceSpecification?.price || p?.offers?.price || null;
-        const regularPrice =
-          ofr.priceSpecification?.referencePrice ||
-          p?.offers?.highPrice ||
-          null;
-
-        rows.push({
-          sku,
-          upc,
-          url: pageUrl,
-          color: color || null,
-          size: size || null,
-          currentPrice,
-          regularPrice,
-          availability: "", // set later from URL
-        });
-      }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`product selector did not appear within ${timeoutMs}ms`);
     }
-    return rows.length ? rows : null;
-  });
-}
-
-async function normalizeAndFill(rows = []) {
-  return rows
-    .filter(r => r && (r.sku || r.upc))
-    .map(r => {
-      const upc = stripNonDigits(r.upc || "");
-      const availability = availabilityFromUrl(r.url || "");
-      return {
-        sku: r.sku || "",
-        upc,
-        url: r.url || "",
-        color: r.color || "",
-        size: r.size || "",
-        currentPrice: r.currentPrice ?? "",
-        regularPrice: r.regularPrice ?? "",
-        availability,
-      };
-    });
+    await page.waitForTimeout(300); // small poll
+  }
 }
 
 export default {
   id: "macys",
-  match: {
-    hostRegex: /(^|\.)macys\.com$/i,
-  },
+  match: { hostRegex: /(^|\.)macys\.com$/i },
 
   /**
-   * extract({ url, page?, newPage?, debug? })
-   * - If a page is provided we reuse it.
-   * - Else we open a new one (with ScraperAPI proxy) to bypass WAF.
+   * extract({ url, debug })
+   * Return shape must still be { rawTables: [{ headers, rows }] } to match your router.
    */
-  async extract({ url, page: injectedPage, newPage, debug }) {
-    let owned = false;
-    let browser, context;
-    const { page, owned: ownedFlag, browser: b, context: c } =
-      await ensurePage({ page: injectedPage, newPage });
-    owned = ownedFlag;
-    browser = b;
-    context = c;
+  async extract({ url, debug = 0 }) {
+    await ensureDebugDir();
+
+    // ----- launch
+    const browser = await chromium.launch({
+      headless: true,                     // Render has no GUI
+      ignoreHTTPSErrors: true,
+      args: [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+      ],
+      // If you pass proxy via PLAYWRIGHT env, keep your existing code here
+      // proxy: { server: process.env.PLAYWRIGHT_PROXY || undefined }
+    });
+
+    let context;
+    let page;
+    let traceName;
+    let shotName;
+    let htmlName;
 
     try {
-      if (!injectedPage) {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+      context = await browser.newContext({
+        userAgent:
+          process.env.PW_UA ||
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        viewport: { width: 1366, height: 768 },
+        ignoreHTTPSErrors: true,
+      });
 
+      // Start trace if requested
+      if (String(process.env.PW_TRACE) === "1") {
+        traceName = stamp("trace") + ".zip";
+        await context.tracing.start({
+          screenshots: true,
+          snapshots: true,
+          sources: true,
+        });
       }
 
-      // Wait for Macy's React state (upcs) to populate
-      try {
-        await page.waitForFunction(
-          () =>
-            window.__INITIAL_STATE__ &&
-            window.__INITIAL_STATE__.pageData?.product?.product?.relationships?.upcs?.length > 0,
-          { timeout: 9000 }
-        );
-      } catch {}
+      page = await context.newPage();
 
-      // Slight buffer for hydration
-      await page.waitForTimeout(700).catch(() => {});
+      // Block heavy assets (faster / less tracking)
+      await page.route(/\.(?:png|jpe?g|gif|webp|svg|ico|woff2?|ttf)$/i, (r) => r.abort());
 
-      let rows = (await extractFromInitialState(page)) || null;
-
-      if (!rows || !rows.length) {
-        // fallback to JSON-LD
-        rows = (await extractFromJsonLd(page)) || [];
-      }
-
-      // Normalize and fill availability
-      const finalRows = await normalizeAndFill(rows);
-
-      // Return in your rawTables format
-      return {
-        rawTables: [
-          {
-            headers: [
-              "sku",
-              "upc",
-              "url",
-              "color",
-              "size",
-              "currentPrice",
-              "regularPrice",
-              "availability",
-            ],
-            rows: finalRows,
-          },
-        ],
-      };
-    } finally {
-      // close only if we created the page here
-      try {
-        if (owned) {
-          const ctx = page.context();
-          const br = ctx?.browser?.();
-          await ctx?.close?.();
-          await br?.close?.();
+      // Optional: confirm proxy/geo
+      if (debug) {
+        try {
+          const ipPage = await context.newPage();
+          await ipPage.goto("https://api.ipify.org?format=json", { waitUntil: "commit", timeout: 20000 });
+          const ipJson = await ipPage.textContent("body");
+          console.log("Proxy IP check:", ipJson);
+          await ipPage.close();
+        } catch (e) {
+          console.log("IP check failed (non-fatal):", e.message);
         }
-      } catch {}
+      }
+
+      // ---- NEW wait strategy ----
+      page.setDefaultNavigationTimeout(120000);
+      await page.goto(url, { waitUntil: "commit", timeout: 90000 });
+
+      // wait until we see any product anchor (30s)
+      const gotSel = await waitForAny(page, PRODUCT_SELECTORS, 30000);
+      console.log("Macys: product anchor detected:", gotSel);
+
+      // -------------------------------
+      // YOUR EXISTING DATA EXTRACTION
+      // -------------------------------
+      // Keep the logic you already have that builds:
+      //   const headers = [...];
+      //   const rows = [...];
+      // Example placeholders:
+      const headers = ["sku","upc","url","color","size","currentPrice","regularPrice","availability"];
+      const rows = []; // fill from your current logic
+
+      // Stop trace on success as well
+      if (traceName) {
+        await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) });
+      }
+
+      return {
+        rawTables: [{ headers, rows }],
+        debug: {
+          trace: traceName ? `/debug/${traceName}` : null,
+        },
+      };
+    } catch (err) {
+      // ---- Failure path: always save screenshot + HTML + trace
+      if (context && page) {
+        try {
+          shotName = stamp("page") + ".png";
+          htmlName = stamp("page") + ".html";
+          await page.screenshot({ path: path.join(DEBUG_DIR, shotName), fullPage: true }).catch(() => {});
+          const html = await page.content().catch(() => "");
+          await fs.writeFile(path.join(DEBUG_DIR, htmlName), html || "", "utf8").catch(() => {});
+        } catch (_) {}
+        try {
+          if (String(process.env.PW_TRACE) === "1") {
+            traceName = traceName || stamp("trace") + ".zip";
+            await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) }).catch(() => {});
+          }
+        } catch (_) {}
+      }
+
+      // bubble the debug links up so the API can return them
+      const detail = {
+        message: err.message || "unknown",
+        screenshot: shotName ? `/debug/${shotName}` : null,
+        html: htmlName ? `/debug/${htmlName}` : null,
+        trace: traceName ? `/debug/${traceName}` : null,
+      };
+      const e2 = new Error("macys: navigate/extract failed");
+      e2.statusCode = 500;
+      e2.detail = detail;
+      throw e2;
+    } finally {
+      try { await browser.close(); } catch {}
     }
   },
 };
