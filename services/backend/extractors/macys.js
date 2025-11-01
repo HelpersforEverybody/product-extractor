@@ -14,33 +14,42 @@ function stamp(prefix) {
   return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
 
-// Wait for JSON-LD or key PDP element
-async function waitPdpReady(page, timeout = 90000) {
-  try {
-    await page.waitForSelector('script[type="application/ld+json"]', { timeout });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Auto-scroll to trigger lazy load
-async function autoScroll(page) {
-  await page.evaluate(async () => {
-    await new Promise((resolve) => {
-      let total = 0;
-      const distance = 500;
-      const limit = Math.max(document.body.scrollHeight, 3000);
-      const timer = setInterval(() => {
-        window.scrollBy(0, distance);
-        total += distance;
-        if (total >= limit) {
-          clearInterval(timer);
-          resolve();
+// Wait for __INITIAL_STATE__ via postMessage (like your inject.js)
+async function waitForInitialState(page, timeout = 30000) {
+  return await page.evaluate(async (timeout) => {
+    return new Promise((resolve) => {
+      const handler = (event) => {
+        if (event.source !== window) return;
+        if (event.data.type === 'MACYS_INITIAL_STATE') {
+          window.removeEventListener('message', handler);
+          try {
+            resolve(JSON.parse(event.data.data));
+          } catch {
+            resolve(null);
+          }
         }
-      }, 150);
+      };
+      window.addEventListener('message', handler);
+
+      // Inject your inject.js logic
+      (function () {
+        try {
+          const safeData = JSON.stringify(window.__INITIAL_STATE__);
+          window.postMessage({
+            type: 'MACYS_INITIAL_STATE',
+            data: safeData
+          }, '*');
+        } catch (err) {
+          console.error('inject.js failed:', err);
+        }
+      })();
+
+      setTimeout(() => {
+        window.removeEventListener('message', handler);
+        resolve(null);
+      }, timeout);
     });
-  });
+  }, timeout);
 }
 
 export default {
@@ -50,9 +59,6 @@ export default {
   async extract({ url, debug = 0 }) {
     await ensureDebugDir();
 
-    // --------------------------------------------------------------
-    // 1. ScraperAPI API endpoint (residential + render)
-    // --------------------------------------------------------------
     const SCRAPERAPI_KEY = process.env.SCRAPERAPI_KEY;
     if (!SCRAPERAPI_KEY) throw new Error("SCRAPERAPI_KEY missing");
 
@@ -64,15 +70,12 @@ export default {
     apiUrl.searchParams.set("country_code", "us");
     apiUrl.searchParams.set("keep_headers", "true");
     apiUrl.searchParams.set("session_number", "macys1");
-    apiUrl.searchParams.set("wait", "8000"); // 8s extra for JS
+    apiUrl.searchParams.set("wait", "15000");
 
-    // --------------------------------------------------------------
-    // 2. Launch Playwright
-    // --------------------------------------------------------------
     const browser = await chromium.launch({
       headless: true,
       ignoreHTTPSErrors: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
 
     let context, page, traceName, shotName, htmlName;
@@ -83,14 +86,11 @@ export default {
         viewport: { width: 1366, height: 768 },
         locale: "en-US",
         timezoneId: "America/New_York",
-        extraHTTPHeaders: { "accept-language": "en-US,en;q=0.9" },
       });
 
       await context.addInitScript(() => {
         Object.defineProperty(navigator, "webdriver", { get: () => false });
         window.chrome = { runtime: {} };
-        Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
-        Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
       });
 
       await context.addCookies([
@@ -106,85 +106,77 @@ export default {
       }
 
       page = await context.newPage();
-      page.setDefaultNavigationTimeout(120000);
+      page.setDefaultNavigationTimeout(180000);
 
-      // --------------------------------------------------------------
-      // 3. Load via ScraperAPI
-      // --------------------------------------------------------------
-      console.log("Loading via ScraperAPI...");
+      // Load via ScraperAPI
       await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 120000 });
 
-      await autoScroll(page);
-      const ready = await waitPdpReady(page, 90000);
-      if (!ready) throw new Error("JSON-LD not found – page not fully loaded");
-
-      // --------------------------------------------------------------
-      // 4. Extract JSON-LD (contains SKU, UPC, offers, variants)
-      // --------------------------------------------------------------
-      const jsonLd = await page.$$eval('script[type="application/ld+json"]', nodes =>
-        nodes.map(n => {
-          try { return JSON.parse(n.textContent); } catch { return null; }
-        }).filter(Boolean)
-      );
-
-      const productData = jsonLd.find(d => d["@type"] === "Product") || {};
-      const { sku, gtin13: upc, offers = {}, name, brand } = productData;
-
-      // --------------------------------------------------------------
-      // 5. Select first variant (size/color) to unlock price/availability
-      // --------------------------------------------------------------
-      let currentPrice = null, regularPrice = null, availability = "unknown";
-
+      // Wait for either JSON-LD or product title
       try {
-        const sizeBtn = await page.locator('button[data-auto="size-swatch"]').first();
-        if (await sizeBtn.isVisible()) {
-          await sizeBtn.click();
-          await page.waitForTimeout(1000);
-        }
-
-        const colorBtn = await page.locator('button[data-auto="color-swatch"]').first();
-        if (await colorBtn.isVisible()) {
-          await colorBtn.click();
-          await page.waitForTimeout(1000);
-        }
-
-        // Re-read price after selection
-        const priceText = await page.locator('[data-auto="price"] .price').first().textContent();
-        const match = priceText.match(/\$?([\d,]+\.?\d*)/g);
-        if (match) {
-          currentPrice = match[0].replace(/[^0-9.]/g, '');
-          regularPrice = match[1] ? match[1].replace(/[^0-9.]/g, '') : currentPrice;
-        }
-
-        availability = await page.locator('[data-auto="availability"]').textContent().catch(() => "In Stock");
-      } catch (e) {
-        console.log("Variant selection failed (normal for sold-out items):", e.message);
+        await page.waitForSelector('#productMktData, [data-auto="product-title"]', { timeout: 60000 });
+      } catch {
+        throw new Error("PDP not detected – page may be blocked or slow");
       }
 
-      // --------------------------------------------------------------
-      // 6. Extract selected color/size
-      // --------------------------------------------------------------
-      const selectedColor = await page.locator('[data-auto="selected-color"]').textContent().catch(() => "N/A");
-      const selectedSize = await page.locator('[data-auto="selected-size"]').textContent().catch(() => "N/A");
+      // === REPLICATE YOUR EXTENSION LOGIC ===
+      const initialState = await waitForInitialState(page, 30000);
+      const sizeMap = {};
 
-      // --------------------------------------------------------------
-      // 7. Build rows
-      // --------------------------------------------------------------
+      if (initialState) {
+        const upcs = initialState?.pageData?.product?.product?.relationships?.upcs || {};
+        Object.values(upcs).forEach(upcObj => {
+          const sizeAttr = upcObj.attributes.find(a => a.name === 'SIZE');
+          if (sizeAttr) {
+            sizeMap[upcObj.identifier.upcNumber.toString()] = sizeAttr.value;
+          }
+        });
+      }
+
+      // Parse #productMktData (JSON-LD)
+      let offers = [];
+      try {
+        const jsonText = await page.locator('#productMktData').textContent();
+        const productData = JSON.parse(jsonText);
+        offers = productData.offers || [];
+      } catch (err) {
+        console.warn("Failed to parse #productMktData:", err);
+      }
+
+      // Merge like your content.js
+      const extractedData = offers.map(offer => {
+        let size = 'N/A';
+        const upc = (offer.SKU || '').replace('USA', '');
+
+        if (offer.itemOffered?.attributes) {
+          const sizeAttr = offer.itemOffered.attributes.find(a =>
+            a?.name?.toUpperCase() === 'SIZE'
+          );
+          if (sizeAttr?.value) size = sizeAttr.value.trim();
+        }
+
+        if (size === 'N/A' && sizeMap[upc]) {
+          size = sizeMap[upc];
+        }
+
+        return {
+          sku: offer.SKU || 'N/A',
+          upc,
+          url,
+          color: offer.itemOffered?.color || 'N/A',
+          size,
+          currentPrice: offer.price ? offer.price.toString() : 'N/A',
+          regularPrice: offer.regularPrice || 'N/A',
+          availability: (offer.availability || '').split('/').pop() || 'N/A'
+        };
+      });
+
+      // === OUTPUT ===
       const headers = ["sku", "upc", "url", "color", "size", "currentPrice", "regularPrice", "availability"];
-      const rows = [[
-        sku || "N/A",
-        upc || "N/A",
-        url,
-        selectedColor,
-        selectedSize,
-        currentPrice || "N/A",
-        regularPrice || "N/A",
-        availability
-      ]];
+      const rows = extractedData.length > 0 ? extractedData.map(d => [
+        d.sku, d.upc, d.url, d.color, d.size, d.currentPrice, d.regularPrice, d.availability
+      ]) : [["N/A", "N/A", url, "N/A", "N/A", "N/A", "N/A", "N/A"]];
 
-      // --------------------------------------------------------------
-      // 8. Debug output
-      // --------------------------------------------------------------
+      // Debug
       if (debug) {
         const okPng = `${stamp("ok")}.png`;
         const okHtml = `${stamp("ok")}.html`;
@@ -192,26 +184,20 @@ export default {
         await fs.writeFile(path.join(DEBUG_DIR, okHtml), await page.content(), "utf8");
       }
 
-      if (traceName) {
-        await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) });
-      }
+      if (traceName) await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) });
 
       return {
         rawTables: [{ headers, rows }],
         debug: { trace: traceName ? toDebugUrl(traceName) : null },
+        _debug: { initialState: !!initialState, offersCount: offers.length }
       };
 
     } catch (err) {
-      // --------------------------------------------------------------
-      // 9. Always save error debug
-      // --------------------------------------------------------------
       if (context && page) {
-        try {
-          shotName = `${stamp("error")}.png`;
-          htmlName = `${stamp("error")}.html`;
-          await page.screenshot({ path: path.join(DEBUG_DIR, shotName), fullPage: true });
-          await fs.writeFile(path.join(DEBUG_DIR, htmlName), await page.content(), "utf8");
-        } catch {}
+        shotName = `${stamp("error")}.png`;
+        htmlName = `${stamp("error")}.html`;
+        await page.screenshot({ path: path.join(DEBUG_DIR, shotName), fullPage: true }).catch(() => {});
+        await fs.writeFile(path.join(DEBUG_DIR, htmlName), await page.content(), "utf8").catch(() => {});
         if (traceName) await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) }).catch(() => {});
       }
 
