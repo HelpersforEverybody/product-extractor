@@ -161,19 +161,25 @@ export default {
       page.setDefaultNavigationTimeout(120000);
 
       // Optional: verify proxy IP in logs
-      if (debug) {
-        try {
-          const ipTab = await context.newPage();
-          await ipTab.goto("https://api.ipify.org?format=json", { waitUntil: "commit", timeout: 20000 });
-          console.log("Proxy IP:", await ipTab.textContent("body"));
-          await ipTab.close();
-        } catch (e) {
-          console.log("IP check failed:", e.message);
-        }
-      }
+     // Optional: verify proxy IP in logs using request API (non-blocking)
+if (debug) {
+  try {
+    const resp = await context.request.get("https://api.ipify.org?format=json", { timeout: 3000 });
+    console.log("Proxy IP:", await resp.text());
+  } catch (e) {
+    console.log("IP check skipped:", e.message);
+  }
+}
+
 
       // 1) hit home so consent/geo apply; try to accept consent
-      await page.goto("https://www.macys.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+      try {
+  await page.goto("https://www.macys.com/", { waitUntil: "domcontentloaded", timeout: 15000 });
+} catch {
+  const err = new Error("proxy/egress: cannot reach macys.com home within 15s");
+  err.statusCode = 502;
+  throw err;
+}
       try { await page.click('button:has-text("Accept")', { timeout: 4000 }); } catch {}
       try { await page.click('[data-auto="footer-accept"]', { timeout: 4000 }); } catch {}
 
