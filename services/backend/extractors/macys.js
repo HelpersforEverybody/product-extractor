@@ -44,8 +44,6 @@ function proxyFromEnv() {
   return undefined;
 }
 
-}
-
 // Macy's PDP anchors that indicate the page is “ready-ish”
 const PDP_SELECTORS = [
   '[data-auto="product-title"]',
