@@ -16,34 +16,6 @@ function stamp(prefix) {
   return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
 
-// Accept either:
-//   PW_PROXY="http://USER:PASS@proxy-host:port"
-// or the trio:
-//   PW_PROXY_SERVER, PW_PROXY_USERNAME, PW_PROXY_PASSWORD
-function proxyFromEnv() {
-  const p = process.env.PW_PROXY;
-  if (p) {
-    try {
-      const u = new URL(p);
-      const server = `${u.protocol}//${u.hostname}:${u.port || 80}`;
-      const username = u.username ? decodeURIComponent(u.username) : undefined;
-      const password = u.password ? decodeURIComponent(u.password) : undefined;
-      return { server, username, password };
-    } catch {
-      // fallback if it's not a URL
-      return { server: p };
-    }
-  }
-  if (process.env.PW_PROXY_SERVER) {
-    return {
-      server: process.env.PW_PROXY_SERVER,
-      username: process.env.PW_PROXY_USERNAME || undefined,
-      password: process.env.PW_PROXY_PASSWORD || undefined,
-    };
-  }
-  return undefined;
-}
-
 // Macy's PDP anchors that indicate the page is “ready-ish”
 const PDP_SELECTORS = [
   '[data-auto="product-title"]',
@@ -107,8 +79,29 @@ export default {
   async extract({ url, debug = 0 }) {
     await ensureDebugDir();
 
-    const proxy = proxyFromEnv();
+    // ------------------------------------------------------------------
+    // 1. ScraperAPI API endpoint (render + premium residential)
+    // ------------------------------------------------------------------
+    const SCRAPERAPI_KEY = process.env.SCRAPERAPI_KEY;
+    if (!SCRAPERAPI_KEY) {
+      const e = new Error("Missing SCRAPERAPI_KEY in environment");
+      e.statusCode = 500;
+      throw e;
+    }
 
+    const apiUrl = new URL("http://api.scraperapi.com");
+    apiUrl.searchParams.set("api_key", SCRAPERAPI_KEY);
+    apiUrl.searchParams.set("url", url);
+    apiUrl.searchParams.set("render", "true");          // full JS render
+    apiUrl.searchParams.set("premium", "true");         // residential IPs
+    apiUrl.searchParams.set("country_code", "us");
+    apiUrl.searchParams.set("keep_headers", "true");
+    apiUrl.searchParams.set("session_number", "macys1"); // sticky session
+    apiUrl.searchParams.set("wait", "5000");            // extra wait for lazy JS
+
+    // ------------------------------------------------------------------
+    // 2. Playwright – NO proxy object, just load the pre-rendered page
+    // ------------------------------------------------------------------
     const browser = await chromium.launch({
       headless: true,
       ignoreHTTPSErrors: true,
@@ -117,7 +110,6 @@ export default {
         "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationControlled",
       ],
-      proxy, // <— use ScraperAPI/your proxy
     });
 
     let context;
@@ -134,8 +126,6 @@ export default {
         viewport: { width: 1366, height: 768 },
         locale: "en-US",
         timezoneId: "America/New_York",
-        geolocation: { latitude: 40.7128, longitude: -74.0060 },
-        permissions: ["geolocation"],
         ignoreHTTPSErrors: true,
         extraHTTPHeaders: { "accept-language": "en-US,en;q=0.9" },
       });
@@ -149,7 +139,7 @@ export default {
         Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
       });
 
-      // US geo cookies (best-effort)
+      // US geo cookies
       await context.addCookies([
         { name: "shippingCountry", value: "US", domain: ".macys.com", path: "/" },
         {
@@ -160,7 +150,7 @@ export default {
         },
       ]);
 
-      // speed up: skip images/fonts (Macy’s is heavy)
+      // skip heavy assets
       await context.route(/\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf)$/i, (r) => r.abort());
 
       if (String(process.env.PW_TRACE) === "1") {
@@ -168,69 +158,28 @@ export default {
         await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
       }
 
-            page = await context.newPage();
+      page = await context.newPage();
       page.setDefaultNavigationTimeout(120000);
 
-      // --- PROBE: can the proxy actually reach macys.com? ---
-      try {
-        const resp = await context.request.get("https://www.macys.com/", { timeout: 8000 });
-        console.log("Probe macys.com status:", resp.status());
-        // Treat 403/5xx as a proxy/egress block
-        if (resp.status() === 403 || resp.status() >= 500) {
-          const e = new Error(`proxy/egress: macys.com responded ${resp.status()}`);
-          e.statusCode = 502;
-          throw e;
-        }
-      } catch (e) {
-        const err = new Error(`proxy/egress: cannot reach macys.com home (${e.message})`);
-        err.statusCode = 502;
-        throw err;
-      }
+      // ------------------------------------------------------------------
+      // 3. Load the ScraperAPI-rendered page
+      // ------------------------------------------------------------------
+      await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 90000 });
 
-      // 1) hit home so consent/geo apply; try to accept consent
-      await page.goto("https://www.macys.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
-      try { await page.click('button:has-text("Accept")', { timeout: 4000 }); } catch {}
-      try { await page.click('[data-auto="footer-accept"]', { timeout: 4000 }); } catch {}
-
-      // 2) navigate to product
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90000 });
-
-
-      // Optional: verify proxy IP in logs
-     // Optional: verify proxy IP in logs using request API (non-blocking)
-if (debug) {
-  try {
-    const resp = await context.request.get("https://api.ipify.org?format=json", { timeout: 3000 });
-    console.log("Proxy IP:", await resp.text());
-  } catch (e) {
-    console.log("IP check skipped:", e.message);
-  }
-}
-
-
-      // 1) hit home so consent/geo apply; try to accept consent
-      try {
-  await page.goto("https://www.macys.com/", { waitUntil: "domcontentloaded", timeout: 15000 });
-} catch {
-  const err = new Error("proxy/egress: cannot reach macys.com home within 15s");
-  err.statusCode = 502;
-  throw err;
-}
-      try { await page.click('button:has-text("Accept")', { timeout: 4000 }); } catch {}
-      try { await page.click('[data-auto="footer-accept"]', { timeout: 4000 }); } catch {}
-
-      // 2) navigate to product
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90000 });
-
+      // ------------------------------------------------------------------
+      // 4. Post-load actions (same as your original logic)
+      // ------------------------------------------------------------------
       await autoScroll(page);
 
       const ready = await waitPdpReady(page, 60000);
-      if (!ready) throw new Error("product selector did not appear within 60000ms");
-      console.log("Macys: PDP looks ready");
+      if (!ready) {
+        throw new Error("PDP selectors / JSON-LD not found within 60s");
+      }
+      console.log("Macys: PDP ready");
 
-      // ------------------------------------
-      // TODO: replace with your real parsing
-      // ------------------------------------
+      // ------------------------------------------------------------------
+      // 5. TODO: Replace with your actual parsing logic
+      // ------------------------------------------------------------------
       const headers = [
         "sku",
         "upc",
@@ -241,15 +190,17 @@ if (debug) {
         "regularPrice",
         "availability",
       ];
-      const rows = []; // fill from your current logic
+      const rows = []; // <-- fill with real data here
 
-      // optional: save artifacts on success when debug flag is set
+      // ------------------------------------------------------------------
+      // 6. Debug artifacts (if requested)
+      // ------------------------------------------------------------------
       if (debug) {
         const okPng = `${stamp("ok")}.png`;
         const okHtml = `${stamp("ok")}.html`;
         await page.screenshot({ path: path.join(DEBUG_DIR, okPng), fullPage: true }).catch(() => {});
-        const html = await page.content().catch(() => "");
-        await fs.writeFile(path.join(DEBUG_DIR, okHtml), html || "", "utf8").catch(() => {});
+        const html = await page.content();
+        await fs.writeFile(path.join(DEBUG_DIR, okHtml), html, "utf8").catch(() => {});
       }
 
       if (traceName) {
@@ -261,7 +212,9 @@ if (debug) {
         debug: { trace: traceName ? toDebugUrl(traceName) : null },
       };
     } catch (err) {
-      // ALWAYS capture artifacts on failure
+      // ------------------------------------------------------------------
+      // 7. Always capture debug on failure
+      // ------------------------------------------------------------------
       if (context && page) {
         try {
           shotName = `${stamp("error")}.png`;
@@ -272,7 +225,6 @@ if (debug) {
         } catch {}
         try {
           if (String(process.env.PW_TRACE) === "1" && traceName) {
-            // if started, ensure we stop and flush the file
             await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) }).catch(() => {});
           }
         } catch {}
