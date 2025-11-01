@@ -14,6 +14,27 @@ function stamp(prefix) {
   return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
 
+// Auto-accept OneTrust cookie consent
+async function acceptCookieConsent(page) {
+  try {
+    const consentFrame = page.frameLocator('iframe[title*="consent"], iframe[src*="onetrust"], iframe#onetrust-banner-sdk')
+      .or(page.locator('iframe'))
+      .first();
+
+    if (await consentFrame.isVisible({ timeout: 10000 })) {
+      console.log("Cookie consent banner detected – accepting...");
+      const acceptButton = consentFrame.locator('button:has-text("Confirm My Choices"), button:has-text("Accept All"), #onetrust-accept-btn-handler, button#onetrust-pc-btn-handler');
+      await acceptButton.click({ timeout: 10000 });
+      await page.waitForTimeout(2000);
+      console.log("Cookie consent accepted");
+      return true;
+    }
+  } catch (err) {
+    console.log("No cookie consent banner found (already accepted or not present)");
+  }
+  return false;
+}
+
 // Wait for __INITIAL_STATE__ via postMessage (like your inject.js)
 async function waitForInitialState(page, timeout = 30000) {
   return await page.evaluate(async (timeout) => {
@@ -108,17 +129,18 @@ export default {
       page = await context.newPage();
       page.setDefaultNavigationTimeout(180000);
 
-      // Load via ScraperAPI
+      // === 1. Load page via ScraperAPI ===
+      console.log("Loading via ScraperAPI...");
       await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 120000 });
 
-      // Wait for either JSON-LD or product title
-      try {
-        await page.waitForSelector('#productMktData, [data-auto="product-title"]', { timeout: 60000 });
-      } catch {
-        throw new Error("PDP not detected – page may be blocked or slow");
-      }
+      // === 2. Auto-accept cookie consent ===
+      await acceptCookieConsent(page);
 
-      // === REPLICATE YOUR EXTENSION LOGIC ===
+      // === 3. Wait for product content ===
+      console.log("Waiting for product data...");
+      await page.waitForSelector('#productMktData, [data-auto="product-title"], h1.pdp-title', { timeout: 60000 });
+
+      // === 4. Replicate your extension logic ===
       const initialState = await waitForInitialState(page, 30000);
       const sizeMap = {};
 
@@ -130,6 +152,9 @@ export default {
             sizeMap[upcObj.identifier.upcNumber.toString()] = sizeAttr.value;
           }
         });
+        console.log("Size map built from __INITIAL_STATE__", Object.keys(sizeMap).length, "entries");
+      } else {
+        console.warn("No __INITIAL_STATE__ found");
       }
 
       // Parse #productMktData (JSON-LD)
@@ -138,15 +163,17 @@ export default {
         const jsonText = await page.locator('#productMktData').textContent();
         const productData = JSON.parse(jsonText);
         offers = productData.offers || [];
+        console.log("Offers loaded from JSON-LD:", offers.length);
       } catch (err) {
-        console.warn("Failed to parse #productMktData:", err);
+        console.warn("Failed to parse #productMktData:", err.message);
       }
 
-      // Merge like your content.js
+      // === 5. Merge offers + size map ===
       const extractedData = offers.map(offer => {
         let size = 'N/A';
         const upc = (offer.SKU || '').replace('USA', '');
 
+        // Try offer attributes first
         if (offer.itemOffered?.attributes) {
           const sizeAttr = offer.itemOffered.attributes.find(a =>
             a?.name?.toUpperCase() === 'SIZE'
@@ -154,6 +181,7 @@ export default {
           if (sizeAttr?.value) size = sizeAttr.value.trim();
         }
 
+        // Fallback to sizeMap
         if (size === 'N/A' && sizeMap[upc]) {
           size = sizeMap[upc];
         }
@@ -170,29 +198,35 @@ export default {
         };
       });
 
-      // === OUTPUT ===
-      const headers = ["sku", "upc", "url", "color", "size", "currentPrice", "regularPrice", "availability"];
-      const rows = extractedData.length > 0 ? extractedData.map(d => [
-        d.sku, d.upc, d.url, d.color, d.size, d.currentPrice, d.regularPrice, d.availability
-      ]) : [["N/A", "N/A", url, "N/A", "N/A", "N/A", "N/A", "N/A"]];
+      console.log("Final extracted rows:", extractedData.length);
 
-      // Debug
+      // === 6. Output ===
+      const headers = ["sku", "upc", "url", "color", "size", "currentPrice", "regularPrice", "availability"];
+      const rows = extractedData.length > 0
+        ? extractedData.map(d => [d.sku, d.upc, d.url, d.color, d.size, d.currentPrice, d.regularPrice, d.availability])
+        : [["N/A", "N/A", url, "N/A", "N/A", "N/A", "N/A", "N/A"]];
+
+      // === 7. Debug artifacts ===
       if (debug) {
         const okPng = `${stamp("ok")}.png`;
         const okHtml = `${stamp("ok")}.html`;
         await page.screenshot({ path: path.join(DEBUG_DIR, okPng), fullPage: true });
         await fs.writeFile(path.join(DEBUG_DIR, okHtml), await page.content(), "utf8");
+        console.log("Debug saved: screenshot + HTML");
       }
 
-      if (traceName) await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) });
+      if (traceName) {
+        await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) });
+      }
 
       return {
         rawTables: [{ headers, rows }],
         debug: { trace: traceName ? toDebugUrl(traceName) : null },
-        _debug: { initialState: !!initialState, offersCount: offers.length }
+        _debug: { initialState: !!initialState, offersCount: offers.length, sizeMapCount: Object.keys(sizeMap).length }
       };
 
     } catch (err) {
+      // === 8. Always capture error debug ===
       if (context && page) {
         shotName = `${stamp("error")}.png`;
         htmlName = `${stamp("error")}.html`;
