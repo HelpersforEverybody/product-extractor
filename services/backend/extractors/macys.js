@@ -20,62 +20,11 @@ async function acceptCookieConsent(page) {
     if (await btn.isVisible({ timeout: 10000 })) {
       await btn.click();
       await page.waitForTimeout(2000);
+      console.log("Cookie banner accepted");
     }
-  } catch {}
-}
-
-async function waitForInitialState(page) {
-  console.log("Waiting for __INITIAL_STATE__...");
-  await page.waitForFunction(() => window.__INITIAL_STATE__ && window.__INITIAL_STATE__.pageData?.product, { timeout: 60000 });
-  console.log("Found __INITIAL_STATE__");
-
-  return await page.evaluate(() => {
-    const state = window.__INITIAL_STATE__;
-    const product = state.pageData?.product?.product;
-    if (!product) return null;
-
-    const upcs = product.relationships?.upcs || {};
-    const offers = product.relationships?.offers || {};
-    const sizeMap = {};
-
-    // Build UPC → Size
-    Object.values(upcs).forEach(u => {
-      const size = u.attributes?.find(a => a.name === 'SIZE')?.value;
-      if (size && u.identifier?.upcNumber) {
-        sizeMap[u.identifier.upcNumber.toString()] = size;
-      }
-    });
-
-    // Build offers
-    const rows = Object.values(offers).map(offer => {
-      const sku = offer.identifier?.sku || 'N/A';
-      const upc = sku.replace('USA', '');
-      let size = 'N/A';
-      let color = 'N/A';
-
-      if (offer.attributes) {
-        const sizeAttr = offer.attributes.find(a => a.name?.toUpperCase() === 'SIZE');
-        const colorAttr = offer.attributes.find(a => a.name?.toUpperCase() === 'COLOR');
-        if (sizeAttr?.value) size = sizeAttr.value;
-        if (colorAttr?.value) color = colorAttr.value;
-      }
-
-      if (size === 'N/A' && sizeMap[upc]) size = sizeMap[upc];
-
-      return {
-        sku,
-        upc,
-        url: window.location.href,
-        color,
-        size,
-        currentPrice: offer.price?.toString() || 'N/A',
-        regularPrice: offer.regularPrice || 'N/A',
-        availability: offer.availability?.split('/').pop() || 'N/A'
-      };
-    });
-
-    return rows.length > 0 ? rows : [{ sku: 'N/A', upc: 'N/A', url: window.location.href, color: 'N/A', size: 'N/A', currentPrice: 'N/A', regularPrice: 'N/A', availability: 'N/A' }];
-  });
+  } catch (e) {
+    console.log("No cookie banner");
+  }
 }
 
 export default {
@@ -120,10 +69,62 @@ export default {
 
       await acceptCookieConsent(page);
 
-      const data = await waitForInitialState(page);
+      // === FIXED: Wait for the script tag ===
+      console.log("Waiting for __INITIAL_STATE__ script...");
+      await page.waitForSelector('script:has-text("__INITIAL_STATE__")', { timeout: 60000 });
+      console.log("Found script tag");
+
+      const scriptText = await page.locator('script:has-text("__INITIAL_STATE__")').textContent();
+      const match = scriptText.match(/window\.__INITIAL_STATE__\s*=\s*({.*?});/s);
+      if (!match) throw new Error("Could not parse __INITIAL_STATE__");
+
+      const state = JSON.parse(match[1]);
+      const product = state.pageData?.product?.product;
+      if (!product) throw new Error("No product data in __INITIAL_STATE__");
+
+      const upcs = product.relationships?.upcs || {};
+      const offers = product.relationships?.offers || {};
+      const sizeMap = {};
+
+      Object.values(upcs).forEach(u => {
+        const size = u.attributes?.find(a => a.name === 'SIZE')?.value;
+        if (size && u.identifier?.upcNumber) {
+          sizeMap[u.identifier.upcNumber.toString()] = size;
+        }
+      });
+
+      const rows = Object.values(offers).map(offer => {
+        const sku = offer.identifier?.sku || 'N/A';
+        const upc = sku.replace('USA', '');
+        let size = 'N/A';
+        let color = 'N/A';
+
+        if (offer.attributes) {
+          const sizeAttr = offer.attributes.find(a => a.name?.toUpperCase() === 'SIZE');
+          const colorAttr = offer.attributes.find(a => a.name?.toUpperCase() === 'COLOR');
+          if (sizeAttr?.value) size = sizeAttr.value;
+          if (colorAttr?.value) color = colorAttr.value;
+        }
+
+        if (size === 'N/A' && sizeMap[upc]) size = sizeMap[upc];
+
+        return [
+          sku,
+          upc,
+          url,
+          color,
+          size,
+          offer.price?.toString() || 'N/A',
+          offer.regularPrice || 'N/A',
+          (offer.availability || '').split('/').pop() || 'N/A'
+        ];
+      });
+
+      if (rows.length === 0) {
+        rows.push(['N/A', 'N/A', url, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A']);
+      }
 
       const headers = ["sku", "upc", "url", "color", "size", "currentPrice", "regularPrice", "availability"];
-      const rows = data.map(d => [d.sku, d.upc, d.url, d.color, d.size, d.currentPrice, d.regularPrice, d.availability]);
 
       if (debug) {
         const png = `${stamp("ok")}.png`;
