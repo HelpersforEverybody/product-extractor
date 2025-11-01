@@ -14,63 +14,91 @@ function stamp(prefix) {
   return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
 
-// Auto-accept OneTrust cookie consent
+// FULL STEALTH + HEADER SPOOF
+async function setupStealth(context) {
+  await context.addInitScript(() => {
+    // Remove webdriver
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+    delete navigator.__proto__.webdriver;
+
+    // Spoof chrome
+    window.chrome = {
+      runtime: {},
+      loadTimes: () => {},
+      csi: () => {},
+    };
+
+    // Spoof plugins
+    Object.defineProperty(navigator, "plugins", {
+      get: () => [1, 2, 3, 4, 5],
+    });
+
+    // Spoof languages
+    Object.defineProperty(navigator, "languages", {
+      get: () => ["en-US", "en"],
+    });
+
+    // Spoof screen
+    Object.defineProperty(screen, "devicePixelRatio", { get: () => 1 });
+
+    // Block known bot detectors
+    const blocked = [
+      "navigator.webdriver",
+      "window.outerWidth",
+      "window.outerHeight",
+      "navigator.plugins",
+      "navigator.languages",
+    ];
+    blocked.forEach(prop => {
+      try { delete window[prop]; } catch {}
+    });
+  });
+}
+
+// Auto-accept cookie consent
 async function acceptCookieConsent(page) {
   try {
-    const consentFrame = page.frameLocator('iframe[title*="consent"], iframe[src*="onetrust"], iframe#onetrust-banner-sdk')
-      .or(page.locator('iframe'))
-      .first();
+    const frame = page.frames().find(f => f.url().includes("onetrust") || f.name().includes("consent"));
+    if (!frame) return false;
 
-    if (await consentFrame.isVisible({ timeout: 10000 })) {
-      console.log("Cookie consent banner detected – accepting...");
-      const acceptButton = consentFrame.locator('button:has-text("Confirm My Choices"), button:has-text("Accept All"), #onetrust-accept-btn-handler, button#onetrust-pc-btn-handler');
-      await acceptButton.click({ timeout: 10000 });
+    const btn = frame.locator('button:has-text("Confirm My Choices"), #onetrust-accept-btn-handler, button[title="Accept"]');
+    if (await btn.isVisible({ timeout: 8000 })) {
+      await btn.click();
       await page.waitForTimeout(2000);
       console.log("Cookie consent accepted");
       return true;
     }
-  } catch (err) {
-    console.log("No cookie consent banner found (already accepted or not present)");
-  }
+  } catch {}
   return false;
 }
 
-// Wait for __INITIAL_STATE__ via postMessage (like your inject.js)
-async function waitForInitialState(page, timeout = 30000) {
-  return await page.evaluate(async (timeout) => {
-    return new Promise((resolve) => {
-      const handler = (event) => {
-        if (event.source !== window) return;
-        if (event.data.type === 'MACYS_INITIAL_STATE') {
+// Wait for __INITIAL_STATE__
+async function waitForInitialState(page) {
+  return await page.evaluate(() => {
+    return new Promise(resolve => {
+      const handler = (e) => {
+        if (e.data.type === 'MACYS_INITIAL_STATE') {
           window.removeEventListener('message', handler);
-          try {
-            resolve(JSON.parse(event.data.data));
-          } catch {
-            resolve(null);
-          }
+          try { resolve(JSON.parse(e.data.data)); }
+          catch { resolve(null); }
         }
       };
       window.addEventListener('message', handler);
 
-      // Inject your inject.js logic
-      (function () {
+      // Trigger inject
+      (function() {
         try {
-          const safeData = JSON.stringify(window.__INITIAL_STATE__);
-          window.postMessage({
-            type: 'MACYS_INITIAL_STATE',
-            data: safeData
-          }, '*');
-        } catch (err) {
-          console.error('inject.js failed:', err);
-        }
+          const data = JSON.stringify(window.__INITIAL_STATE__);
+          window.postMessage({ type: 'MACYS_INITIAL_STATE', data }, '*');
+        } catch {}
       })();
 
       setTimeout(() => {
         window.removeEventListener('message', handler);
         resolve(null);
-      }, timeout);
+      }, 20000);
     });
-  }, timeout);
+  });
 }
 
 export default {
@@ -91,159 +119,164 @@ export default {
     apiUrl.searchParams.set("country_code", "us");
     apiUrl.searchParams.set("keep_headers", "true");
     apiUrl.searchParams.set("session_number", "macys1");
-    apiUrl.searchParams.set("wait", "15000");
+    apiUrl.searchParams.set("wait", "20000"); // 20s render
 
     const browser = await chromium.launch({
       headless: true,
       ignoreHTTPSErrors: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-web-security"],
     });
 
     let context, page, traceName, shotName, htmlName;
 
     try {
       context = await browser.newContext({
-        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
         viewport: { width: 1366, height: 768 },
         locale: "en-US",
         timezoneId: "America/New_York",
+        javaScriptEnabled: true,
+        extraHTTPHeaders: {
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Accept-Encoding": "gzip, deflate, br",
+          "DNT": "1",
+          "Connection": "keep-alive",
+          "Upgrade-Insecure-Requests": "1",
+        },
       });
 
-      await context.addInitScript(() => {
-        Object.defineProperty(navigator, "webdriver", { get: () => false });
-        window.chrome = { runtime: {} };
-      });
+      // FULL STEALTH
+      await setupStealth(context);
 
       await context.addCookies([
         { name: "shippingCountry", value: "US", domain: ".macys.com", path: "/" },
-        { name: "macys_onlineZipCode", value: process.env.MACYS_ZIP || "10001", domain: ".macys.com", path: "/" },
+        { name: "macys_onlineZipCode", value: "10001", domain: ".macys.com", path: "/" },
       ]);
 
-      await context.route(/\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|css)$/, r => r.abort());
+      await context.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2}", route => route.abort());
 
-      if (String(process.env.PW_TRACE) === "1") {
+      if (process.env.PW_TRACE === "1") {
         traceName = `${stamp("trace")}.zip`;
-        await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+        await context.tracing.start({ screenshots: true, snapshots: true });
       }
 
       page = await context.newPage();
       page.setDefaultNavigationTimeout(180000);
 
-      // === 1. Load page via ScraperAPI ===
-      console.log("Loading via ScraperAPI...");
-      await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 120000 });
+      // === LOAD PAGE ===
+      await page.goto(apiUrl.toString(), { waitUntil: "domcontentloaded", timeout: 120000 });
+      await page.waitForTimeout(3000);
 
-      // === 2. Auto-accept cookie consent ===
+      // === ACCEPT COOKIES ===
       await acceptCookieConsent(page);
 
-      // === 3. Wait for product content ===
-      console.log("Waiting for product data...");
-      await page.waitForSelector('#productMktData, [data-auto="product-title"], h1.pdp-title', { timeout: 60000 });
+      // === AUTO SCROLL ===
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(2000);
 
-      // === 4. Replicate your extension logic ===
-      const initialState = await waitForInitialState(page, 30000);
+      // === WAIT FOR CONTENT ===
+      const selectors = [
+        '#productMktData',
+        '[data-auto="product-title"]',
+        'h1.pdp-title',
+        '.product-title',
+        'h1[data-el="product-title"]'
+      ];
+
+      let loaded = false;
+      for (const sel of selectors) {
+        try {
+          await page.waitForSelector(sel, { timeout: 10000 });
+          console.log(`PDP loaded via: ${sel}`);
+          loaded = true;
+          break;
+        } catch {}
+      }
+
+      if (!loaded) throw new Error("PDP content not found – possible bot detection");
+
+      // === EXTRACT DATA ===
+      const initialState = await waitForInitialState(page);
       const sizeMap = {};
 
       if (initialState) {
         const upcs = initialState?.pageData?.product?.product?.relationships?.upcs || {};
-        Object.values(upcs).forEach(upcObj => {
-          const sizeAttr = upcObj.attributes.find(a => a.name === 'SIZE');
-          if (sizeAttr) {
-            sizeMap[upcObj.identifier.upcNumber.toString()] = sizeAttr.value;
+        Object.values(upcs).forEach(u => {
+          const size = u.attributes?.find(a => a.name === 'SIZE')?.value;
+          if (size && u.identifier?.upcNumber) {
+            sizeMap[u.identifier.upcNumber.toString()] = size;
           }
         });
-        console.log("Size map built from __INITIAL_STATE__", Object.keys(sizeMap).length, "entries");
-      } else {
-        console.warn("No __INITIAL_STATE__ found");
       }
 
-      // Parse #productMktData (JSON-LD)
       let offers = [];
       try {
         const jsonText = await page.locator('#productMktData').textContent();
-        const productData = JSON.parse(jsonText);
-        offers = productData.offers || [];
-        console.log("Offers loaded from JSON-LD:", offers.length);
-      } catch (err) {
-        console.warn("Failed to parse #productMktData:", err.message);
+        const data = JSON.parse(jsonText);
+        offers = data.offers || [];
+      } catch (e) {
+        console.warn("No #productMktData – using fallback DOM parse");
       }
 
-      // === 5. Merge offers + size map ===
-      const extractedData = offers.map(offer => {
+      const rows = offers.map(o => {
+        const upc = (o.SKU || '').replace('USA', '');
         let size = 'N/A';
-        const upc = (offer.SKU || '').replace('USA', '');
-
-        // Try offer attributes first
-        if (offer.itemOffered?.attributes) {
-          const sizeAttr = offer.itemOffered.attributes.find(a =>
-            a?.name?.toUpperCase() === 'SIZE'
-          );
-          if (sizeAttr?.value) size = sizeAttr.value.trim();
+        if (o.itemOffered?.attributes) {
+          const attr = o.itemOffered.attributes.find(a => a.name?.toUpperCase() === 'SIZE');
+          if (attr?.value) size = attr.value;
         }
+        if (size === 'N/A' && sizeMap[upc]) size = sizeMap[upc];
 
-        // Fallback to sizeMap
-        if (size === 'N/A' && sizeMap[upc]) {
-          size = sizeMap[upc];
-        }
-
-        return {
-          sku: offer.SKU || 'N/A',
+        return [
+          o.SKU || 'N/A',
           upc,
           url,
-          color: offer.itemOffered?.color || 'N/A',
+          o.itemOffered?.color || 'N/A',
           size,
-          currentPrice: offer.price ? offer.price.toString() : 'N/A',
-          regularPrice: offer.regularPrice || 'N/A',
-          availability: (offer.availability || '').split('/').pop() || 'N/A'
-        };
+          o.price?.toString() || 'N/A',
+          o.regularPrice || 'N/A',
+          (o.availability || '').split('/').pop() || 'N/A'
+        ];
       });
 
-      console.log("Final extracted rows:", extractedData.length);
+      if (rows.length === 0) {
+        // Fallback: extract from DOM
+        const title = await page.locator('[data-auto="product-title"], h1').first().textContent().catch(() => '');
+        rows.push(['N/A', 'N/A', url, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A']);
+      }
 
-      // === 6. Output ===
       const headers = ["sku", "upc", "url", "color", "size", "currentPrice", "regularPrice", "availability"];
-      const rows = extractedData.length > 0
-        ? extractedData.map(d => [d.sku, d.upc, d.url, d.color, d.size, d.currentPrice, d.regularPrice, d.availability])
-        : [["N/A", "N/A", url, "N/A", "N/A", "N/A", "N/A", "N/A"]];
 
-      // === 7. Debug artifacts ===
       if (debug) {
-        const okPng = `${stamp("ok")}.png`;
-        const okHtml = `${stamp("ok")}.html`;
-        await page.screenshot({ path: path.join(DEBUG_DIR, okPng), fullPage: true });
-        await fs.writeFile(path.join(DEBUG_DIR, okHtml), await page.content(), "utf8");
-        console.log("Debug saved: screenshot + HTML");
+        const png = `${stamp("ok")}.png`;
+        const html = `${stamp("ok")}.html`;
+        await page.screenshot({ path: path.join(DEBUG_DIR, png), fullPage: true });
+        await fs.writeFile(path.join(DEBUG_DIR, html), await page.content());
       }
 
-      if (traceName) {
-        await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) });
-      }
+      if (traceName) await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) });
 
-      return {
-        rawTables: [{ headers, rows }],
-        debug: { trace: traceName ? toDebugUrl(traceName) : null },
-        _debug: { initialState: !!initialState, offersCount: offers.length, sizeMapCount: Object.keys(sizeMap).length }
-      };
+      return { rawTables: [{ headers, rows }] };
 
     } catch (err) {
-      // === 8. Always capture error debug ===
-      if (context && page) {
+      if (page) {
         shotName = `${stamp("error")}.png`;
         htmlName = `${stamp("error")}.html`;
         await page.screenshot({ path: path.join(DEBUG_DIR, shotName), fullPage: true }).catch(() => {});
-        await fs.writeFile(path.join(DEBUG_DIR, htmlName), await page.content(), "utf8").catch(() => {});
+        await fs.writeFile(path.join(DEBUG_DIR, htmlName), await page.content()).catch(() => {});
         if (traceName) await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) }).catch(() => {});
       }
 
-      const e2 = new Error("Extraction failed");
-      e2.statusCode = 500;
-      e2.detail = {
+      const e = new Error("Extraction failed");
+      e.statusCode = 500;
+      e.detail = {
         message: err.message,
         screenshot: shotName ? toDebugUrl(shotName) : null,
         html: htmlName ? toDebugUrl(htmlName) : null,
         trace: traceName ? toDebugUrl(traceName) : null,
       };
-      throw e2;
+      throw e;
     } finally {
       await browser.close().catch(() => {});
     }
