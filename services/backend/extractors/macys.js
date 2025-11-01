@@ -6,8 +6,6 @@ import { getDebugDir, toDebugUrl } from "../utils/debugPath.js";
 
 const DEBUG_DIR = getDebugDir();
 
-/* ------------------------- helpers ------------------------- */
-
 async function ensureDebugDir() {
   await fs.mkdir(DEBUG_DIR, { recursive: true }).catch(() => {});
 }
@@ -16,22 +14,23 @@ function stamp(prefix) {
   return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
 
-// Macy's PDP anchors that indicate the page is “ready-ish”
-const PDP_SELECTORS = [
-  '[data-auto="product-title"]',
-  'h1[data-el="product-title"]',
-  "h1.pdp-title",
-  '[data-auto="pdp"]',
-  'div[data-auto="product-page"]',
-];
+// Wait for JSON-LD or key PDP element
+async function waitPdpReady(page, timeout = 90000) {
+  try {
+    await page.waitForSelector('script[type="application/ld+json"]', { timeout });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-// gentle autoscroll to trigger lazy hydration
+// Auto-scroll to trigger lazy load
 async function autoScroll(page) {
   await page.evaluate(async () => {
     await new Promise((resolve) => {
       let total = 0;
-      const distance = 400;
-      const limit = Math.max(document.body.scrollHeight, 2500);
+      const distance = 500;
+      const limit = Math.max(document.body.scrollHeight, 3000);
       const timer = setInterval(() => {
         window.scrollBy(0, distance);
         total += distance;
@@ -39,119 +38,67 @@ async function autoScroll(page) {
           clearInterval(timer);
           resolve();
         }
-      }, 200);
+      }, 150);
     });
   });
 }
-
-// wait up to waitMs until either a PDP selector appears OR Product JSON-LD is present
-async function waitPdpReady(page, waitMs = 60000) {
-  const start = Date.now();
-  while (Date.now() - start < waitMs) {
-    // selector path
-    for (const sel of PDP_SELECTORS) {
-      if (await page.$(sel)) return true;
-    }
-    // JSON-LD fallback
-    const ldOk = await page
-      .$$eval('script[type="application/ld+json"]', (nodes) => {
-        const all = nodes.map((n) => n.textContent || "").join("\n");
-        return /"@type"\s*:\s*"Product"/i.test(all);
-      })
-      .catch(() => false);
-    if (ldOk) return true;
-
-    await page.waitForTimeout(600);
-  }
-  return false;
-}
-
-/* ------------------------- extractor ------------------------- */
 
 export default {
   id: "macys",
   match: { hostRegex: /(^|\.)macys\.com$/i },
 
-  /**
-   * extract({ url, debug })
-   * Must return: { rawTables: [{ headers, rows }] }
-   */
   async extract({ url, debug = 0 }) {
     await ensureDebugDir();
 
-    // ------------------------------------------------------------------
-    // 1. ScraperAPI API endpoint (render + premium residential)
-    // ------------------------------------------------------------------
+    // --------------------------------------------------------------
+    // 1. ScraperAPI API endpoint (residential + render)
+    // --------------------------------------------------------------
     const SCRAPERAPI_KEY = process.env.SCRAPERAPI_KEY;
-    if (!SCRAPERAPI_KEY) {
-      const e = new Error("Missing SCRAPERAPI_KEY in environment");
-      e.statusCode = 500;
-      throw e;
-    }
+    if (!SCRAPERAPI_KEY) throw new Error("SCRAPERAPI_KEY missing");
 
     const apiUrl = new URL("http://api.scraperapi.com");
     apiUrl.searchParams.set("api_key", SCRAPERAPI_KEY);
     apiUrl.searchParams.set("url", url);
-    apiUrl.searchParams.set("render", "true");          // full JS render
-    apiUrl.searchParams.set("premium", "true");         // residential IPs
+    apiUrl.searchParams.set("render", "true");
+    apiUrl.searchParams.set("premium", "true");
     apiUrl.searchParams.set("country_code", "us");
     apiUrl.searchParams.set("keep_headers", "true");
-    apiUrl.searchParams.set("session_number", "macys1"); // sticky session
-    apiUrl.searchParams.set("wait", "5000");            // extra wait for lazy JS
+    apiUrl.searchParams.set("session_number", "macys1");
+    apiUrl.searchParams.set("wait", "8000"); // 8s extra for JS
 
-    // ------------------------------------------------------------------
-    // 2. Playwright – NO proxy object, just load the pre-rendered page
-    // ------------------------------------------------------------------
+    // --------------------------------------------------------------
+    // 2. Launch Playwright
+    // --------------------------------------------------------------
     const browser = await chromium.launch({
       headless: true,
       ignoreHTTPSErrors: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-blink-features=AutomationControlled",
-      ],
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
     });
 
-    let context;
-    let page;
-    let traceName;
-    let shotName;
-    let htmlName;
+    let context, page, traceName, shotName, htmlName;
 
     try {
       context = await browser.newContext({
-        userAgent:
-          process.env.PW_UA ||
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         viewport: { width: 1366, height: 768 },
         locale: "en-US",
         timezoneId: "America/New_York",
-        ignoreHTTPSErrors: true,
         extraHTTPHeaders: { "accept-language": "en-US,en;q=0.9" },
       });
 
-      // light stealth
       await context.addInitScript(() => {
         Object.defineProperty(navigator, "webdriver", { get: () => false });
-        // @ts-ignore
         window.chrome = { runtime: {} };
         Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
         Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
       });
 
-      // US geo cookies
       await context.addCookies([
         { name: "shippingCountry", value: "US", domain: ".macys.com", path: "/" },
-        {
-          name: "macys_onlineZipCode",
-          value: process.env.MACYS_ZIP || "10001",
-          domain: ".macys.com",
-          path: "/",
-        },
+        { name: "macys_onlineZipCode", value: process.env.MACYS_ZIP || "10001", domain: ".macys.com", path: "/" },
       ]);
 
-      // skip heavy assets
-      await context.route(/\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf)$/i, (r) => r.abort());
+      await context.route(/\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|css)$/, r => r.abort());
 
       if (String(process.env.PW_TRACE) === "1") {
         traceName = `${stamp("trace")}.zip`;
@@ -161,46 +108,88 @@ export default {
       page = await context.newPage();
       page.setDefaultNavigationTimeout(120000);
 
-      // ------------------------------------------------------------------
-      // 3. Load the ScraperAPI-rendered page
-      // ------------------------------------------------------------------
-      await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 90000 });
+      // --------------------------------------------------------------
+      // 3. Load via ScraperAPI
+      // --------------------------------------------------------------
+      console.log("Loading via ScraperAPI...");
+      await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 120000 });
 
-      // ------------------------------------------------------------------
-      // 4. Post-load actions (same as your original logic)
-      // ------------------------------------------------------------------
       await autoScroll(page);
+      const ready = await waitPdpReady(page, 90000);
+      if (!ready) throw new Error("JSON-LD not found – page not fully loaded");
 
-      const ready = await waitPdpReady(page, 60000);
-      if (!ready) {
-        throw new Error("PDP selectors / JSON-LD not found within 60s");
+      // --------------------------------------------------------------
+      // 4. Extract JSON-LD (contains SKU, UPC, offers, variants)
+      // --------------------------------------------------------------
+      const jsonLd = await page.$$eval('script[type="application/ld+json"]', nodes =>
+        nodes.map(n => {
+          try { return JSON.parse(n.textContent); } catch { return null; }
+        }).filter(Boolean)
+      );
+
+      const productData = jsonLd.find(d => d["@type"] === "Product") || {};
+      const { sku, gtin13: upc, offers = {}, name, brand } = productData;
+
+      // --------------------------------------------------------------
+      // 5. Select first variant (size/color) to unlock price/availability
+      // --------------------------------------------------------------
+      let currentPrice = null, regularPrice = null, availability = "unknown";
+
+      try {
+        const sizeBtn = await page.locator('button[data-auto="size-swatch"]').first();
+        if (await sizeBtn.isVisible()) {
+          await sizeBtn.click();
+          await page.waitForTimeout(1000);
+        }
+
+        const colorBtn = await page.locator('button[data-auto="color-swatch"]').first();
+        if (await colorBtn.isVisible()) {
+          await colorBtn.click();
+          await page.waitForTimeout(1000);
+        }
+
+        // Re-read price after selection
+        const priceText = await page.locator('[data-auto="price"] .price').first().textContent();
+        const match = priceText.match(/\$?([\d,]+\.?\d*)/g);
+        if (match) {
+          currentPrice = match[0].replace(/[^0-9.]/g, '');
+          regularPrice = match[1] ? match[1].replace(/[^0-9.]/g, '') : currentPrice;
+        }
+
+        availability = await page.locator('[data-auto="availability"]').textContent().catch(() => "In Stock");
+      } catch (e) {
+        console.log("Variant selection failed (normal for sold-out items):", e.message);
       }
-      console.log("Macys: PDP ready");
 
-      // ------------------------------------------------------------------
-      // 5. TODO: Replace with your actual parsing logic
-      // ------------------------------------------------------------------
-      const headers = [
-        "sku",
-        "upc",
-        "url",
-        "color",
-        "size",
-        "currentPrice",
-        "regularPrice",
-        "availability",
-      ];
-      const rows = []; // <-- fill with real data here
+      // --------------------------------------------------------------
+      // 6. Extract selected color/size
+      // --------------------------------------------------------------
+      const selectedColor = await page.locator('[data-auto="selected-color"]').textContent().catch(() => "N/A");
+      const selectedSize = await page.locator('[data-auto="selected-size"]').textContent().catch(() => "N/A");
 
-      // ------------------------------------------------------------------
-      // 6. Debug artifacts (if requested)
-      // ------------------------------------------------------------------
+      // --------------------------------------------------------------
+      // 7. Build rows
+      // --------------------------------------------------------------
+      const headers = ["sku", "upc", "url", "color", "size", "currentPrice", "regularPrice", "availability"];
+      const rows = [[
+        sku || "N/A",
+        upc || "N/A",
+        url,
+        selectedColor,
+        selectedSize,
+        currentPrice || "N/A",
+        regularPrice || "N/A",
+        availability
+      ]];
+
+      // --------------------------------------------------------------
+      // 8. Debug output
+      // --------------------------------------------------------------
       if (debug) {
         const okPng = `${stamp("ok")}.png`;
         const okHtml = `${stamp("ok")}.html`;
-        await page.screenshot({ path: path.join(DEBUG_DIR, okPng), fullPage: true }).catch(() => {});
-        const html = await page.content();
-        await fs.writeFile(path.join(DEBUG_DIR, okHtml), html, "utf8").catch(() => {});
+        await page.screenshot({ path: path.join(DEBUG_DIR, okPng), fullPage: true });
+        await fs.writeFile(path.join(DEBUG_DIR, okHtml), await page.content(), "utf8");
       }
 
       if (traceName) {
@@ -211,36 +200,32 @@ export default {
         rawTables: [{ headers, rows }],
         debug: { trace: traceName ? toDebugUrl(traceName) : null },
       };
+
     } catch (err) {
-      // ------------------------------------------------------------------
-      // 7. Always capture debug on failure
-      // ------------------------------------------------------------------
+      // --------------------------------------------------------------
+      // 9. Always save error debug
+      // --------------------------------------------------------------
       if (context && page) {
         try {
           shotName = `${stamp("error")}.png`;
           htmlName = `${stamp("error")}.html`;
-          await page.screenshot({ path: path.join(DEBUG_DIR, shotName), fullPage: true }).catch(() => {});
-          const html = await page.content().catch(() => "");
-          await fs.writeFile(path.join(DEBUG_DIR, htmlName), html || "", "utf8").catch(() => {});
+          await page.screenshot({ path: path.join(DEBUG_DIR, shotName), fullPage: true });
+          await fs.writeFile(path.join(DEBUG_DIR, htmlName), await page.content(), "utf8");
         } catch {}
-        try {
-          if (String(process.env.PW_TRACE) === "1" && traceName) {
-            await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) }).catch(() => {});
-          }
-        } catch {}
+        if (traceName) await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) }).catch(() => {});
       }
 
-      const e2 = new Error("Server error");
+      const e2 = new Error("Extraction failed");
       e2.statusCode = 500;
       e2.detail = {
-        message: err?.message || "unknown",
+        message: err.message,
         screenshot: shotName ? toDebugUrl(shotName) : null,
         html: htmlName ? toDebugUrl(htmlName) : null,
         trace: traceName ? toDebugUrl(traceName) : null,
       };
       throw e2;
     } finally {
-      try { await browser.close(); } catch {}
+      await browser.close().catch(() => {});
     }
   },
 };
