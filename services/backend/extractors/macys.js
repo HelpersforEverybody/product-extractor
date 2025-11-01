@@ -6,17 +6,34 @@ import { getDebugDir, toDebugUrl } from "../utils/debugPath.js";
 
 const DEBUG_DIR = getDebugDir();
 
-// ensure /public/debug exists
+/* ------------------------- helpers ------------------------- */
+
 async function ensureDebugDir() {
   await fs.mkdir(DEBUG_DIR, { recursive: true }).catch(() => {});
 }
 
-// timestamped filename helper
 function stamp(prefix) {
   return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
 
-// selectors that indicate a Macy's PDP is “ready-ish”
+// Accept either PW_PROXY (full URL) OR PW_PROXY_SERVER + USERNAME/PASSWORD
+function proxyFromEnv() {
+  const p = process.env.PW_PROXY || "";
+  if (p) {
+    // Playwright accepts "http://user:pass@host:port"
+    return { server: p };
+  }
+  if (process.env.PW_PROXY_SERVER) {
+    return {
+      server: process.env.PW_PROXY_SERVER,
+      username: process.env.PW_PROXY_USERNAME || undefined,
+      password: process.env.PW_PROXY_PASSWORD || undefined,
+    };
+  }
+  return undefined;
+}
+
+// Macy's PDP anchors that indicate the page is “ready-ish”
 const PDP_SELECTORS = [
   '[data-auto="product-title"]',
   'h1[data-el="product-title"]',
@@ -31,7 +48,7 @@ async function autoScroll(page) {
     await new Promise((resolve) => {
       let total = 0;
       const distance = 400;
-      const limit = Math.max(document.body.scrollHeight, 2000);
+      const limit = Math.max(document.body.scrollHeight, 2500);
       const timer = setInterval(() => {
         window.scrollBy(0, distance);
         total += distance;
@@ -44,10 +61,11 @@ async function autoScroll(page) {
   });
 }
 
-// wait up to waitMs until either a PDP selector appears OR a Product JSON-LD is present
+// wait up to waitMs until either a PDP selector appears OR Product JSON-LD is present
 async function waitPdpReady(page, waitMs = 60000) {
   const start = Date.now();
   while (Date.now() - start < waitMs) {
+    // selector path
     for (const sel of PDP_SELECTORS) {
       if (await page.$(sel)) return true;
     }
@@ -55,7 +73,7 @@ async function waitPdpReady(page, waitMs = 60000) {
     const ldOk = await page
       .$$eval('script[type="application/ld+json"]', (nodes) => {
         const all = nodes.map((n) => n.textContent || "").join("\n");
-        return /\"@type\"\s*:\s*\"Product\"/i.test(all);
+        return /"@type"\s*:\s*"Product"/i.test(all);
       })
       .catch(() => false);
     if (ldOk) return true;
@@ -64,6 +82,8 @@ async function waitPdpReady(page, waitMs = 60000) {
   }
   return false;
 }
+
+/* ------------------------- extractor ------------------------- */
 
 export default {
   id: "macys",
@@ -76,7 +96,8 @@ export default {
   async extract({ url, debug = 0 }) {
     await ensureDebugDir();
 
-    // ---------- launch (proxy picked from env if provided) ----------
+    const proxy = proxyFromEnv();
+
     const browser = await chromium.launch({
       headless: true,
       ignoreHTTPSErrors: true,
@@ -85,13 +106,7 @@ export default {
         "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationControlled",
       ],
-      proxy: process.env.PW_PROXY_SERVER
-        ? {
-            server: process.env.PW_PROXY_SERVER,
-            username: process.env.PW_PROXY_USERNAME || undefined,
-            password: process.env.PW_PROXY_PASSWORD || undefined,
-          }
-        : undefined,
+      proxy, // <— use ScraperAPI/your proxy
     });
 
     let context;
@@ -114,7 +129,7 @@ export default {
         extraHTTPHeaders: { "accept-language": "en-US,en;q=0.9" },
       });
 
-      // stealth-ish tweaks
+      // light stealth
       await context.addInitScript(() => {
         Object.defineProperty(navigator, "webdriver", { get: () => false });
         // @ts-ignore
@@ -123,11 +138,19 @@ export default {
         Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
       });
 
-      // useful cookies for geo
+      // US geo cookies (best-effort)
       await context.addCookies([
         { name: "shippingCountry", value: "US", domain: ".macys.com", path: "/" },
-        { name: "macys_onlineZipCode", value: process.env.MACYS_ZIP || "10001", domain: ".macys.com", path: "/" },
+        {
+          name: "macys_onlineZipCode",
+          value: process.env.MACYS_ZIP || "10001",
+          domain: ".macys.com",
+          path: "/",
+        },
       ]);
+
+      // speed up: skip images/fonts (Macy’s is heavy)
+      await context.route(/\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf)$/i, (r) => r.abort());
 
       if (String(process.env.PW_TRACE) === "1") {
         traceName = `${stamp("trace")}.zip`;
@@ -137,14 +160,11 @@ export default {
       page = await context.newPage();
       page.setDefaultNavigationTimeout(120000);
 
-      // optional: show proxy IP in logs
+      // Optional: verify proxy IP in logs
       if (debug) {
         try {
           const ipTab = await context.newPage();
-          await ipTab.goto("https://api.ipify.org?format=json", {
-            waitUntil: "commit",
-            timeout: 20000,
-          });
+          await ipTab.goto("https://api.ipify.org?format=json", { waitUntil: "commit", timeout: 20000 });
           console.log("Proxy IP:", await ipTab.textContent("body"));
           await ipTab.close();
         } catch (e) {
@@ -152,31 +172,23 @@ export default {
         }
       }
 
-      // hit home so consent/geo apply
+      // 1) hit home so consent/geo apply; try to accept consent
       await page.goto("https://www.macys.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
-      // dismiss common consent (best-effort)
-      try {
-        await page.click('button:has-text("Accept")', { timeout: 4000 });
-      } catch {}
-      try {
-        await page.click('[data-auto="footer-accept"]', { timeout: 4000 });
-      } catch {}
+      try { await page.click('button:has-text("Accept")', { timeout: 4000 }); } catch {}
+      try { await page.click('[data-auto="footer-accept"]', { timeout: 4000 }); } catch {}
 
-      // now navigate to the product page
+      // 2) navigate to product
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90000 });
 
-      // help hydration
       await autoScroll(page);
 
-      // wait for readiness (selector or JSON-LD)
       const ready = await waitPdpReady(page, 60000);
       if (!ready) throw new Error("product selector did not appear within 60000ms");
       console.log("Macys: PDP looks ready");
 
-      // -----------------------------
-      // TODO: your existing extraction
-      // -----------------------------
-      // Keep the headers your popup expects:
+      // ------------------------------------
+      // TODO: replace with your real parsing
+      // ------------------------------------
       const headers = [
         "sku",
         "upc",
@@ -187,9 +199,17 @@ export default {
         "regularPrice",
         "availability",
       ];
-      const rows = []; // <— fill with your current logic if you have it
+      const rows = []; // fill from your current logic
 
-      // stop trace on success
+      // optional: save artifacts on success when debug flag is set
+      if (debug) {
+        const okPng = `${stamp("ok")}.png`;
+        const okHtml = `${stamp("ok")}.html`;
+        await page.screenshot({ path: path.join(DEBUG_DIR, okPng), fullPage: true }).catch(() => {});
+        const html = await page.content().catch(() => "");
+        await fs.writeFile(path.join(DEBUG_DIR, okHtml), html || "", "utf8").catch(() => {});
+      }
+
       if (traceName) {
         await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) });
       }
@@ -199,7 +219,7 @@ export default {
         debug: { trace: traceName ? toDebugUrl(traceName) : null },
       };
     } catch (err) {
-      // ---------- ALWAYS capture artifacts on failure ----------
+      // ALWAYS capture artifacts on failure
       if (context && page) {
         try {
           shotName = `${stamp("error")}.png`;
@@ -209,15 +229,14 @@ export default {
           await fs.writeFile(path.join(DEBUG_DIR, htmlName), html || "", "utf8").catch(() => {});
         } catch {}
         try {
-          if (String(process.env.PW_TRACE) === "1" && !traceName) {
-            traceName = `${stamp("trace")}.zip`;
+          if (String(process.env.PW_TRACE) === "1" && traceName) {
+            // if started, ensure we stop and flush the file
             await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) }).catch(() => {});
           }
         } catch {}
       }
 
       const e2 = new Error("Server error");
-      // pass rich details to router so frontend can show links
       e2.statusCode = 500;
       e2.detail = {
         message: err?.message || "unknown",
