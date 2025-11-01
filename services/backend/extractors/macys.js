@@ -1,35 +1,16 @@
 // services/backend/extractors/macys.js
 import { chromium } from "playwright";
-import fs from "fs/promises";
-import path from "path";
-import { getDebugDir, toDebugUrl } from "../utils/debugPath.js";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 const DEBUG_DIR = path.join(process.cwd(), "public", "debug");
 async function ensureDebugDir() {
-  await fs.mkdir(DEBUG_DIR, { recursive: true }).catch(() => {});
+  try { await fs.mkdir(DEBUG_DIR, { recursive: true }); } catch {}
 }
-function stamp(name) {
-  const t = new Date().toISOString().replace(/[:.]/g, "-");
-  return `${name}-${t}`;
+function stamp(prefix) {
+  return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
-const outDir = getDebugDir();
-const ts = new Date().toISOString().replace(/[:]/g, "-");
 
-const pngName = `page-${ts}.png`;
-await page.screenshot({ path: path.join(outDir, pngName), fullPage: true });
-
-const htmlName = `page-${ts}.html`;
-await fs.writeFile(path.join(outDir, htmlName), await page.content());
-
-// if tracing enabled:
-const traceName = `trace-${ts}.zip`;
-await context.tracing.stop({ path: path.join(outDir, traceName) });
-
-result.debug = {
-  screenshot: toDebugUrl(pngName),
-  html: toDebugUrl(htmlName),
-  trace: toDebugUrl(traceName),
-};
 // Macy's product anchors we consider "page is ready-ish"
 const PRODUCT_SELECTORS = [
   '[data-auto="product-title"]',
@@ -49,7 +30,7 @@ async function waitForAny(page, selectors, timeoutMs) {
     if (Date.now() - start > timeoutMs) {
       throw new Error(`product selector did not appear within ${timeoutMs}ms`);
     }
-    await page.waitForTimeout(300); // small poll
+    await page.waitForTimeout(300);
   }
 }
 
@@ -59,29 +40,27 @@ export default {
 
   /**
    * extract({ url, debug })
-   * Return shape must still be { rawTables: [{ headers, rows }] } to match your router.
+   * Return shape must be { rawTables: [{ headers, rows }] }.
    */
   async extract({ url, debug = 0 }) {
     await ensureDebugDir();
 
-    // ----- launch
     const browser = await chromium.launch({
-      headless: true,                     // Render has no GUI
+      headless: true,
       ignoreHTTPSErrors: true,
       args: [
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
       ],
-      // If you pass proxy via PLAYWRIGHT env, keep your existing code here
-      // proxy: { server: process.env.PLAYWRIGHT_PROXY || undefined }
     });
 
     let context;
     let page;
-    let traceName;
-    let shotName;
-    let htmlName;
+    let traceName;            // /public/debug/<file>.zip
+    let screenshotName;       // /public/debug/<file>.png
+    let htmlName;             // /public/debug/<file>.html
 
     try {
       context = await browser.newContext({
@@ -92,9 +71,9 @@ export default {
         ignoreHTTPSErrors: true,
       });
 
-      // Start trace if requested
+      // Optional Playwright trace
       if (String(process.env.PW_TRACE) === "1") {
-        traceName = stamp("trace") + ".zip";
+        traceName = `${stamp("trace")}.zip`;
         await context.tracing.start({
           screenshots: true,
           snapshots: true,
@@ -104,81 +83,86 @@ export default {
 
       page = await context.newPage();
 
-      // Block heavy assets (faster / less tracking)
-      await page.route(/\.(?:png|jpe?g|gif|webp|svg|ico|woff2?|ttf)$/i, (r) => r.abort());
+      // Block heavy assets
+      await page.route(/\.(?:png|jpe?g|gif|webp|svg|ico|woff2?|ttf)$/i, r => r.abort());
 
-      // Optional: confirm proxy/geo
+      // Optional proxy/geo check
       if (debug) {
         try {
           const ipPage = await context.newPage();
           await ipPage.goto("https://api.ipify.org?format=json", { waitUntil: "commit", timeout: 20000 });
-          const ipJson = await ipPage.textContent("body");
-          console.log("Proxy IP check:", ipJson);
+          console.log("Proxy IP:", await ipPage.textContent("body"));
           await ipPage.close();
         } catch (e) {
           console.log("IP check failed (non-fatal):", e.message);
         }
       }
 
-      // ---- NEW wait strategy ----
+      // Navigate & wait
       page.setDefaultNavigationTimeout(120000);
       await page.goto(url, { waitUntil: "commit", timeout: 90000 });
 
-      // wait until we see any product anchor (30s)
       const gotSel = await waitForAny(page, PRODUCT_SELECTORS, 30000);
       console.log("Macys: product anchor detected:", gotSel);
 
       // -------------------------------
-      // YOUR EXISTING DATA EXTRACTION
+      // TODO: your real extraction here
       // -------------------------------
-      // Keep the logic you already have that builds:
-      //   const headers = [...];
-      //   const rows = [...];
-      // Example placeholders:
       const headers = ["sku","upc","url","color","size","currentPrice","regularPrice","availability"];
-      const rows = []; // fill from your current logic
+      const rows = []; // build from the page
 
-      // Stop trace on success as well
+      // Optionally capture artifacts on success if debug
+      if (debug) {
+        try {
+          screenshotName = `${stamp("page")}.png`;
+          htmlName = `${stamp("page")}.html`;
+          await page.screenshot({ path: path.join(DEBUG_DIR, screenshotName), fullPage: true }).catch(() => {});
+          const html = await page.content().catch(() => "");
+          await fs.writeFile(path.join(DEBUG_DIR, htmlName), html || "", "utf8").catch(() => {});
+        } catch {}
+      }
+
       if (traceName) {
-        await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) });
+        await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) }).catch(() => {});
       }
 
       return {
         rawTables: [{ headers, rows }],
         debug: {
+          screenshot: screenshotName ? `/debug/${screenshotName}` : null,
+          html: htmlName ? `/debug/${htmlName}` : null,
           trace: traceName ? `/debug/${traceName}` : null,
         },
       };
     } catch (err) {
-      // ---- Failure path: always save screenshot + HTML + trace
+      // Always capture artifacts on failure
       if (context && page) {
         try {
-          shotName = stamp("page") + ".png";
-          htmlName = stamp("page") + ".html";
-          await page.screenshot({ path: path.join(DEBUG_DIR, shotName), fullPage: true }).catch(() => {});
+          screenshotName = `${stamp("error")}.png`;
+          htmlName = `${stamp("error")}.html`;
+          await page.screenshot({ path: path.join(DEBUG_DIR, screenshotName), fullPage: true }).catch(() => {});
           const html = await page.content().catch(() => "");
           await fs.writeFile(path.join(DEBUG_DIR, htmlName), html || "", "utf8").catch(() => {});
-        } catch (_) {}
+        } catch {}
         try {
           if (String(process.env.PW_TRACE) === "1") {
-            traceName = traceName || stamp("trace") + ".zip";
+            traceName = traceName || `${stamp("trace")}.zip`;
             await context.tracing.stop({ path: path.join(DEBUG_DIR, traceName) }).catch(() => {});
           }
-        } catch (_) {}
+        } catch {}
       }
 
-      // bubble the debug links up so the API can return them
-      const detail = {
+      const e2 = new Error("macys: navigate/extract failed");
+      e2.statusCode = 500;
+      e2.detail = {
         message: err.message || "unknown",
-        screenshot: shotName ? `/debug/${shotName}` : null,
+        screenshot: screenshotName ? `/debug/${screenshotName}` : null,
         html: htmlName ? `/debug/${htmlName}` : null,
         trace: traceName ? `/debug/${traceName}` : null,
       };
-      const e2 = new Error("macys: navigate/extract failed");
-      e2.statusCode = 500;
-      e2.detail = detail;
       throw e2;
     } finally {
+      try { await context?.close(); } catch {}
       try { await browser.close(); } catch {}
     }
   },
