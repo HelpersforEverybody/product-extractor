@@ -2,6 +2,7 @@
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import path from "path";
+import { getDebugDir, toDebugUrl } from "../utils/debugPath.js";
 
 const DEBUG_DIR = path.join(process.cwd(), "public", "debug");
 async function ensureDebugDir() {
@@ -11,7 +12,24 @@ function stamp(name) {
   const t = new Date().toISOString().replace(/[:.]/g, "-");
   return `${name}-${t}`;
 }
+const outDir = getDebugDir();
+const ts = new Date().toISOString().replace(/[:]/g, "-");
 
+const pngName = `page-${ts}.png`;
+await page.screenshot({ path: path.join(outDir, pngName), fullPage: true });
+
+const htmlName = `page-${ts}.html`;
+await fs.writeFile(path.join(outDir, htmlName), await page.content());
+
+// if tracing enabled:
+const traceName = `trace-${ts}.zip`;
+await context.tracing.stop({ path: path.join(outDir, traceName) });
+
+result.debug = {
+  screenshot: toDebugUrl(pngName),
+  html: toDebugUrl(htmlName),
+  trace: toDebugUrl(traceName),
+};
 // Macy's product anchors we consider "page is ready-ish"
 const PRODUCT_SELECTORS = [
   '[data-auto="product-title"]',
