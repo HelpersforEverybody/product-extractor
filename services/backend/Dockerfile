@@ -2,26 +2,23 @@ FROM mcr.microsoft.com/playwright:v1.56.1-jammy
 
 WORKDIR /app
 
-# 1) Copy only the package metadata first (for better layer caching).
-# If you don't have a package-lock.json in repo, this COPY will still succeed,
-# but the file won't exist in the image.
-COPY services/backend/package.json ./ 
-COPY services/backend/package-lock.json ./  # keep this line; if absent it’s fine
+# Copy package manifests; the wildcard safely copies package-lock.json if present
+COPY services/backend/package*.json ./
 
-# 2) Install deps as root. Use npm ci if lockfile exists, otherwise fallback to npm install.
+# Install deps as root. Use npm ci when the lockfile exists, otherwise fallback.
 RUN if [ -f package-lock.json ]; then \
       npm ci --omit=dev; \
     else \
       npm install --omit=dev; \
     fi
 
-# 3) Copy the rest of the backend source.
+# Copy the rest of the backend
 COPY services/backend/ ./
 
-# 4) Ensure the debug folder exists and is writable.
+# Ensure debug dir exists and is writable
 RUN mkdir -p /app/public/debug && chown -R pwuser:pwuser /app/public
 
-# 5) Drop privileges only AFTER dependencies are installed.
+# Drop privileges after install
 USER pwuser
 
 ENV NODE_ENV=production
