@@ -157,8 +157,33 @@ export default {
         await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
       }
 
-      page = await context.newPage();
+            page = await context.newPage();
       page.setDefaultNavigationTimeout(120000);
+
+      // --- PROBE: can the proxy actually reach macys.com? ---
+      try {
+        const resp = await context.request.get("https://www.macys.com/", { timeout: 8000 });
+        console.log("Probe macys.com status:", resp.status());
+        // Treat 403/5xx as a proxy/egress block
+        if (resp.status() === 403 || resp.status() >= 500) {
+          const e = new Error(`proxy/egress: macys.com responded ${resp.status()}`);
+          e.statusCode = 502;
+          throw e;
+        }
+      } catch (e) {
+        const err = new Error(`proxy/egress: cannot reach macys.com home (${e.message})`);
+        err.statusCode = 502;
+        throw err;
+      }
+
+      // 1) hit home so consent/geo apply; try to accept consent
+      await page.goto("https://www.macys.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+      try { await page.click('button:has-text("Accept")', { timeout: 4000 }); } catch {}
+      try { await page.click('[data-auto="footer-accept"]', { timeout: 4000 }); } catch {}
+
+      // 2) navigate to product
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90000 });
+
 
       // Optional: verify proxy IP in logs
      // Optional: verify proxy IP in logs using request API (non-blocking)
