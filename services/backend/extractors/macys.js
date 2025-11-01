@@ -16,12 +16,23 @@ function stamp(prefix) {
   return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
 
-// Accept either PW_PROXY (full URL) OR PW_PROXY_SERVER + USERNAME/PASSWORD
+// Accept either:
+//   PW_PROXY="http://USER:PASS@proxy-host:port"
+// or the trio:
+//   PW_PROXY_SERVER, PW_PROXY_USERNAME, PW_PROXY_PASSWORD
 function proxyFromEnv() {
-  const p = process.env.PW_PROXY || "";
+  const p = process.env.PW_PROXY;
   if (p) {
-    // Playwright accepts "http://user:pass@host:port"
-    return { server: p };
+    try {
+      const u = new URL(p);
+      const server = `${u.protocol}//${u.hostname}:${u.port || 80}`;
+      const username = u.username ? decodeURIComponent(u.username) : undefined;
+      const password = u.password ? decodeURIComponent(u.password) : undefined;
+      return { server, username, password };
+    } catch {
+      // fallback if it's not a URL
+      return { server: p };
+    }
   }
   if (process.env.PW_PROXY_SERVER) {
     return {
@@ -31,6 +42,8 @@ function proxyFromEnv() {
     };
   }
   return undefined;
+}
+
 }
 
 // Macy's PDP anchors that indicate the page is “ready-ish”
