@@ -14,25 +14,25 @@ function stamp(prefix) {
   return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
 
-async function acceptCookieConsent(page) {
-  try {
-    const btn = page.locator('button:has-text("Confirm My Choices"), #onetrust-accept-btn-handler');
-    if (await btn.isVisible({ timeout: 10000 })) {
-      await btn.click();
-      await page.waitForTimeout(2000);
-      console.log("Cookie banner accepted");
-    }
-  } catch (e) {
-    console.log("No cookie banner");
-  }
-}
-
 export default {
   id: "macys",
   match: { hostRegex: /(^|\.)macys\.com$/i },
 
   async extract({ url, debug = 0 }) {
     await ensureDebugDir();
+
+    const SCRAPERAPI_KEY = process.env.SCRAPERAPI_KEY;
+    if (!SCRAPERAPI_KEY) throw new Error("SCRAPERAPI_KEY missing");
+
+    const apiUrl = new URL("http://api.scraperapi.com");
+    apiUrl.searchParams.set("api_key", SCRAPERAPI_KEY);
+    apiUrl.searchParams.set("url", url);
+    apiUrl.searchParams.set("render", "true");
+    apiUrl.searchParams.set("premium", "true");
+    apiUrl.searchParams.set("country_code", "us");
+    apiUrl.searchParams.set("keep_headers", "true");
+    apiUrl.searchParams.set("wait", "30000"); // 30s render
+    apiUrl.searchParams.set("session_number", "macys1");
 
     const browser = await chromium.launch({
       headless: true,
@@ -46,7 +46,6 @@ export default {
         userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
         viewport: { width: 1366, height: 768 },
         locale: "en-US",
-        timezoneId: "America/New_York",
       });
 
       await context.addCookies([
@@ -62,25 +61,21 @@ export default {
       }
 
       page = await context.newPage();
-      page.setDefaultNavigationTimeout(90000);
+      page.setDefaultNavigationTimeout(180000);
 
-      console.log("Loading:", url);
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+      console.log("Loading via ScraperAPI...");
+      await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 150000 });
 
-      await acceptCookieConsent(page);
-
-      // === FIXED: Wait for the script tag ===
-      console.log("Waiting for __INITIAL_STATE__ script...");
+      // Wait for __INITIAL_STATE__ script
       await page.waitForSelector('script:has-text("__INITIAL_STATE__")', { timeout: 60000 });
-      console.log("Found script tag");
 
       const scriptText = await page.locator('script:has-text("__INITIAL_STATE__")').textContent();
       const match = scriptText.match(/window\.__INITIAL_STATE__\s*=\s*({.*?});/s);
-      if (!match) throw new Error("Could not parse __INITIAL_STATE__");
+      if (!match) throw new Error("No __INITIAL_STATE__");
 
       const state = JSON.parse(match[1]);
       const product = state.pageData?.product?.product;
-      if (!product) throw new Error("No product data in __INITIAL_STATE__");
+      if (!product) throw new Error("No product");
 
       const upcs = product.relationships?.upcs || {};
       const offers = product.relationships?.offers || {};
@@ -119,10 +114,6 @@ export default {
           (offer.availability || '').split('/').pop() || 'N/A'
         ];
       });
-
-      if (rows.length === 0) {
-        rows.push(['N/A', 'N/A', url, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A']);
-      }
 
       const headers = ["sku", "upc", "url", "color", "size", "currentPrice", "regularPrice", "availability"];
 
