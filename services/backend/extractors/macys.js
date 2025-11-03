@@ -16,21 +16,32 @@ function stamp(prefix) {
 
 async function acceptCookieConsent(page) {
   try {
-    console.log("Waiting for OneTrust banner...");
-    const frame = page.frames().find(f => f.url().includes("onetrust"));
-    if (!frame) return false;
+    console.log("Waiting for OneTrust iframe...");
+    await page.waitForSelector('iframe[src*="onetrust"], iframe[title*="consent"]', { timeout: 20000 });
 
-    const button = frame.locator('button:has-text("Confirm My Choices"), #onetrust-accept-btn-handler');
-    if (await button.isVisible({ timeout: 15000 })) {
-      await button.click();
-      await page.waitForTimeout(3000);
-      console.log("Cookie consent accepted");
-      return true;
+    const iframe = page.frames().find(f => 
+      f.url().includes("onetrust") || 
+      f.name().includes("consent") ||
+      f.url().includes("cookie")
+    );
+
+    if (!iframe) {
+      console.log("No iframe found");
+      return false;
     }
+
+    console.log("Found iframe, waiting for button...");
+    const button = iframe.locator('button:has-text("Confirm My Choices"), #onetrust-pc-btn-handler, #onetrust-accept-btn-handler');
+    
+    await button.waitFor({ state: "visible", timeout: 15000 });
+    await button.click({ force: true });
+    await page.waitForTimeout(4000);
+    console.log("Cookie banner accepted");
+    return true;
   } catch (e) {
-    console.log("No banner or already accepted");
+    console.log("Banner not found or already accepted:", e.message);
+    return false;
   }
-  return false;
 }
 
 export default {
@@ -50,7 +61,7 @@ export default {
     apiUrl.searchParams.set("premium", "true");
     apiUrl.searchParams.set("country_code", "us");
     apiUrl.searchParams.set("keep_headers", "true");
-    apiUrl.searchParams.set("wait", "45000");
+    apiUrl.searchParams.set("wait", "50000"); // 50s render
     apiUrl.searchParams.set("session_number", "macys1");
 
     const browser = await chromium.launch({
@@ -85,16 +96,16 @@ export default {
       console.log("Loading via ScraperAPI...");
       await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 180000 });
 
-      // === AUTO-CLICK COOKIE BANNER ===
+      // === AUTO-CLICK BANNER ===
       await acceptCookieConsent(page);
 
-      // === WAIT FOR __INITIAL_STATE__ ===
+      // === WAIT FOR REACT APP ===
       console.log("Waiting for __INITIAL_STATE__...");
       await page.waitForFunction(
         () => window.__INITIAL_STATE__ && window.__INITIAL_STATE__.pageData?.product?.product,
         { timeout: 90000 }
       );
-      console.log("Found __INITIAL_STATE__");
+      console.log("Product data loaded");
 
       const state = await page.evaluate(() => window.__INITIAL_STATE__);
       const product = state.pageData?.product?.product;
