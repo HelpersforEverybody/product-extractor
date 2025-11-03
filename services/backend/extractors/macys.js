@@ -31,7 +31,7 @@ export default {
     apiUrl.searchParams.set("premium", "true");
     apiUrl.searchParams.set("country_code", "us");
     apiUrl.searchParams.set("keep_headers", "true");
-    apiUrl.searchParams.set("wait", "30000"); // 30s render
+    apiUrl.searchParams.set("wait", "45000"); // 45s render
     apiUrl.searchParams.set("session_number", "macys1");
 
     const browser = await chromium.launch({
@@ -63,19 +63,20 @@ export default {
       page = await context.newPage();
       page.setDefaultNavigationTimeout(180000);
 
-      console.log("Loading via ScraperAPI...");
-      await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 150000 });
+      console.log("Loading via ScraperAPI with 45s render...");
+      await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 180000 });
 
-      // Wait for __INITIAL_STATE__ script
-      await page.waitForSelector('script:has-text("__INITIAL_STATE__")', { timeout: 60000 });
+      // === WAIT FOR __INITIAL_STATE__ IN JS ===
+      console.log("Waiting for window.__INITIAL_STATE__...");
+      await page.waitForFunction(
+        () => window.__INITIAL_STATE__ && window.__INITIAL_STATE__.pageData?.product?.product,
+        { timeout: 90000 }
+      );
+      console.log("Found __INITIAL_STATE__ in JS");
 
-      const scriptText = await page.locator('script:has-text("__INITIAL_STATE__")').textContent();
-      const match = scriptText.match(/window\.__INITIAL_STATE__\s*=\s*({.*?});/s);
-      if (!match) throw new Error("No __INITIAL_STATE__");
-
-      const state = JSON.parse(match[1]);
+      const state = await page.evaluate(() => window.__INITIAL_STATE__);
       const product = state.pageData?.product?.product;
-      if (!product) throw new Error("No product");
+      if (!product) throw new Error("No product in __INITIAL_STATE__");
 
       const upcs = product.relationships?.upcs || {};
       const offers = product.relationships?.offers || {};
