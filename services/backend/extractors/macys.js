@@ -14,6 +14,25 @@ function stamp(prefix) {
   return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
 
+async function acceptCookieConsent(page) {
+  try {
+    console.log("Waiting for OneTrust banner...");
+    const frame = page.frames().find(f => f.url().includes("onetrust"));
+    if (!frame) return false;
+
+    const button = frame.locator('button:has-text("Confirm My Choices"), #onetrust-accept-btn-handler');
+    if (await button.isVisible({ timeout: 15000 })) {
+      await button.click();
+      await page.waitForTimeout(3000);
+      console.log("Cookie consent accepted");
+      return true;
+    }
+  } catch (e) {
+    console.log("No banner or already accepted");
+  }
+  return false;
+}
+
 export default {
   id: "macys",
   match: { hostRegex: /(^|\.)macys\.com$/i },
@@ -31,7 +50,7 @@ export default {
     apiUrl.searchParams.set("premium", "true");
     apiUrl.searchParams.set("country_code", "us");
     apiUrl.searchParams.set("keep_headers", "true");
-    apiUrl.searchParams.set("wait", "45000"); // 45s render
+    apiUrl.searchParams.set("wait", "45000");
     apiUrl.searchParams.set("session_number", "macys1");
 
     const browser = await chromium.launch({
@@ -63,20 +82,23 @@ export default {
       page = await context.newPage();
       page.setDefaultNavigationTimeout(180000);
 
-      console.log("Loading via ScraperAPI with 45s render...");
+      console.log("Loading via ScraperAPI...");
       await page.goto(apiUrl.toString(), { waitUntil: "networkidle", timeout: 180000 });
 
-      // === WAIT FOR __INITIAL_STATE__ IN JS ===
-      console.log("Waiting for window.__INITIAL_STATE__...");
+      // === AUTO-CLICK COOKIE BANNER ===
+      await acceptCookieConsent(page);
+
+      // === WAIT FOR __INITIAL_STATE__ ===
+      console.log("Waiting for __INITIAL_STATE__...");
       await page.waitForFunction(
         () => window.__INITIAL_STATE__ && window.__INITIAL_STATE__.pageData?.product?.product,
         { timeout: 90000 }
       );
-      console.log("Found __INITIAL_STATE__ in JS");
+      console.log("Found __INITIAL_STATE__");
 
       const state = await page.evaluate(() => window.__INITIAL_STATE__);
       const product = state.pageData?.product?.product;
-      if (!product) throw new Error("No product in __INITIAL_STATE__");
+      if (!product) throw new Error("No product data");
 
       const upcs = product.relationships?.upcs || {};
       const offers = product.relationships?.offers || {};
